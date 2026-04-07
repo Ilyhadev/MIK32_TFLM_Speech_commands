@@ -1,8 +1,8 @@
+
 default:
   tags:
     - common
-
 include:
-  - project: verif/ci
+  - project: education/verif/2026/mcu-riscv/ci
     ref: master
     file: run-mik32.yml
