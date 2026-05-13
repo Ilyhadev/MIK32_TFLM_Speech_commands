@@ -3,11 +3,11 @@
 #include "mik32_hal_irq.h"
 
 #define zeroValue 0
-#define CAPACITY 16
+#define CAPACITY 480
 
 struct CircularBuffer
 {
-		uint8_t *values;
+		uint16_t *values;
 		uint16_t capacity;
 		uint16_t size;
 		uint8_t head;
@@ -15,15 +15,15 @@ struct CircularBuffer
 };
 
 static struct CircularBuffer circular_buffer;
-static uint8_t values_array[CAPACITY];
+static uint16_t values_array[CAPACITY];
 
-static uint8_t pop(ByteCircularBuffer buffer);
-static void push(ByteCircularBuffer buffer, uint8_t value);
+static uint16_t pop(ByteCircularBuffer buffer);
+static void push(ByteCircularBuffer buffer, uint16_t value);
 static void increaseSize(ByteCircularBuffer buffer);
 static void decreaseSize(ByteCircularBuffer buffer);
 static void resetHeadIndexIfReachedBound(ByteCircularBuffer buffer);
-static void putValue(ByteCircularBuffer buffer, uint8_t value);
-static uint8_t getValue(ByteCircularBuffer buffer);
+static void putValue(ByteCircularBuffer buffer, uint16_t value);
+static uint16_t getValue(ByteCircularBuffer buffer);
 static void resetTailIndexIfReachedBound(ByteCircularBuffer buffer);
 
 ByteCircularBuffer ByteCircularBuffer_Create(uint16_t capacity)
@@ -67,19 +67,19 @@ uint8_t ByteCircularBuffer_IsEmpty(ByteCircularBuffer buffer)
 	return result;
 }
 
-void ByteCircularBuffer_Push(ByteCircularBuffer buffer, uint8_t value)
+void ByteCircularBuffer_Push(ByteCircularBuffer buffer, uint16_t value)
 {
 	HAL_IRQ_DisableInterrupts();
     push(buffer, value);
 	HAL_IRQ_EnableInterrupts();
 }
 
-void ByteCircularBuffer_PushFromISR(ByteCircularBuffer buffer, uint8_t value)
+void ByteCircularBuffer_PushFromISR(ByteCircularBuffer buffer, uint16_t value)
 {
 	push(buffer, value);
 }
 
-uint8_t ByteCircularBuffer_Pop(ByteCircularBuffer buffer)
+uint16_t ByteCircularBuffer_Pop(ByteCircularBuffer buffer)
 {
 	uint8_t result;
 	
@@ -90,7 +90,7 @@ uint8_t ByteCircularBuffer_Pop(ByteCircularBuffer buffer)
 	return result;
 }
 
-uint8_t ByteCircularBuffer_PopFromISR(ByteCircularBuffer buffer)
+uint16_t ByteCircularBuffer_PopFromISR(ByteCircularBuffer buffer)
 {		
 	uint8_t result;
 	
@@ -99,12 +99,12 @@ uint8_t ByteCircularBuffer_PopFromISR(ByteCircularBuffer buffer)
 	return result;
 }
 
-uint8_t ByteCircularBuffer_GetSize(ByteCircularBuffer buffer)
+uint16_t ByteCircularBuffer_GetSize(ByteCircularBuffer buffer)
 {
 	return buffer->size;
 }
 
-static uint8_t pop(ByteCircularBuffer buffer)
+static uint16_t pop(ByteCircularBuffer buffer)
 {
 	uint8_t result;
 	
@@ -121,7 +121,7 @@ static uint8_t pop(ByteCircularBuffer buffer)
 	return result;
 }
 
-static void push(ByteCircularBuffer buffer, uint8_t value)
+static void push(ByteCircularBuffer buffer, uint16_t value)
 {
 	putValue(buffer, value);
 	increaseSize(buffer);
@@ -149,13 +149,13 @@ static void resetHeadIndexIfReachedBound(ByteCircularBuffer buffer)
 		buffer->head = 0;
 }
 
-static void putValue(ByteCircularBuffer buffer, uint8_t value)
+static void putValue(ByteCircularBuffer buffer, uint16_t value)
 {
 	resetHeadIndexIfReachedBound(buffer);
 	buffer->values[buffer->head++] = value;
 }
 
-static uint8_t getValue(ByteCircularBuffer buffer)
+static uint16_t getValue(ByteCircularBuffer buffer)
 {
 	resetTailIndexIfReachedBound(buffer);
 	return buffer->values[buffer->tail++];

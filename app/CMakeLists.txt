@@ -6,7 +6,8 @@ add_executable(${APP_NAME}
     debug_io.cc
     mik32_tflm_log.c
     circular_buffer.c
-    queue.c
+    riscv-irq.c
+    startup.c
 )
 
 target_link_libraries(${APP_NAME}
