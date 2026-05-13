@@ -4,3 +4,6 @@
 [submodule "hardware/mik32v2-shared"]
 	path = hardware/mik32v2-shared
 	url = https://github.com/MikronMIK32/mik32v2-shared.git
+[submodule "third_party/tflite-micro"]
+	path = third_party/tflite-micro
+	url = https://github.com/tensorflow/tflite-micro.git

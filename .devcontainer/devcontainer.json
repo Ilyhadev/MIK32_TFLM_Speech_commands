@@ -19,8 +19,7 @@
 
 	"runArgs": [
 		"--privileged",
-		"--device=/dev/ttyUSB0:/dev/ttyUSB0",
-		"--device=/dev/ttyUSB1:/dev/ttyUSB1"
+		"-v", "/dev:/dev"
 	],
 
 	// Features to add to the dev container. More info: https://containers.dev/features.

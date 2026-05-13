@@ -1,7 +1,19 @@
+
+void *__dso_handle __attribute__((weak));
+
 #include "mik32_hal_adc.h"
+#include "mik32_hal_irq.h"
+#include "mik32_hal_dma.h"
 #include "mik32_hal_usart.h"
 #include "mik32_hal_scr1_timer.h"
+#include "scr1_timer.h"
+#include "timer32.h"
 #include "xprintf.h"
+#include "tflm_wrapper.h"
+#include "kiss_fft_link_test.h"
+
+
+#define SYSTEM_FREQ_HZ 32000000UL
 
 #define ADC_CHANNEL_TOTAL                6U
 #define ADC_CONVERSIONS_PER_CHANNEL      2U
@@ -9,18 +21,27 @@
 #define ADC_REF_VOLTAGE_MV               1200U /* mV */
 #define MILLIVOLTS_PER_VOLT              1000U
 #define LOOP_DELAY_MS                    800U
-
+#define SAMPLE_FREQ_HZ (16000)
+#define BLINK_PERIOD_TICKS (SYSTEM_FREQ_HZ / SAMPLE_FREQ_HZ)
 
 static void SystemClock_Config();
 static void USART_Init();
 
 static USART_HandleTypeDef husart0;
 ADC_HandleTypeDef hadc;
+DMA_InitTypeDef hdma;
 
+void TMR_Init();
 static void ADC_Init(void);
+static void DMA_Init(void);
+static void configure_interrupts();
+static uint16_t rx_buffer[400];
+
+DMA_ChannelHandleTypeDef hdma_ch_adc_to_mem;
 
 int main()
 {
+
     uint16_t adc_value = 0U;
     uint32_t integer_part = 0U;
     uint32_t fractional_part = 0U;
@@ -28,6 +49,23 @@ int main()
 
     USART_Init();
     ADC_Init();
+    DMA_Init();
+
+    configure_interrupts();
+
+    xprintf("Start\r\n");
+    xprintf("Model len: %d bytes\r\n", (int)tflm_model_len_bytes());
+    int tflm_rc = tflm_init();
+    if (tflm_rc != 0) {
+        xprintf("FAIL rc=%d err=%d\r\n", tflm_rc, tflm_last_error());
+    } else {
+        xprintf("Arena used: %d bytes\r\n", (int)tflm_arena_used_bytes());
+        xprintf("OK\r\n");
+    }
+    xprintf("FFT: %d\n", kiss_fft_fixed16_link_smoke());
+
+    xprintf("input bytes=%u\r\n",
+    (unsigned)tflm_input_bytes());
 
     while (1)
     {
@@ -46,6 +84,17 @@ int main()
         }
         HAL_DelayMs(LOOP_DELAY_MS);
     }
+}
+void trap_handler()
+{
+    if(EPIC_CHECK_TIMER32_0()) {
+        // Handle DMA when timer overflows on 16KHz
+
+        TIMER32_0->INT_CLEAR = TIMER32_INT_OVERFLOW_M;
+        EPIC->CLEAR = EPIC_LINE_TIMER32_0_S;
+    }
+
+    HAL_EPIC_Clear(0xFFFFFFFF);
 }
 
 void SystemClock_Config(void)
@@ -66,12 +115,40 @@ void SystemClock_Config(void)
     HAL_PCC_Config(&PCC_OscInit);
 }
 
+void TMR_Init() {
+    // Включение тактирования TIMER32_0
+    PM->CLK_APB_M_SET = PM_CLOCK_APB_M_TIMER32_0_M;
+    TIMER32_0->ENABLE = 0;
+    TIMER32_0->TOP = BLINK_PERIOD_TICKS;
+    TIMER32_0->PRESCALER = 0;
+    TIMER32_0->CONTROL =
+        TIMER32_CONTROL_MODE_UP_M | TIMER32_CONTROL_CLOCK_PRESCALER_M;
+    TIMER32_0->INT_CLEAR = 0xFFFFFFFF;
+    TIMER32_0->ENABLE = 1;
+    // Включение прерывания по переполнению
+    TIMER32_0->INT_MASK = TIMER32_INT_OVERFLOW_M;
+}
+
+void DMA_Init(void)
+{
+    hdma.Instance = DMA_CONFIG;
+    hdma.CurrentValue = DMA_CURRENT_VALUE_ENABLE;
+    HAL_DMA_Init(&hdma);
+}
+
 static void ADC_Init(void) {
     hadc.Instance = ANALOG_REG;
     hadc.Init.EXTRef = ADC_EXTREF_OFF;
     hadc.Init.EXTClb = ADC_EXTCLB_CLBREF;
 
     HAL_ADC_Init(&hadc);
+}
+
+void configure_interrupts() {
+    __HAL_PCC_EPIC_CLK_ENABLE();
+    HAL_EPIC_MaskLevelSet(HAL_EPIC_TIMER32_0_MASK);
+    //HAL_USART_RXNE_EnableInterrupt(&husart0);
+    HAL_IRQ_EnableInterrupts();
 }
 
 void HAL_ADC_MspInit(ADC_HandleTypeDef *hadc) {
@@ -85,6 +162,28 @@ void HAL_ADC_MspInit(ADC_HandleTypeDef *hadc) {
 
     GPIO_InitStruct.Pin = GPIO_PIN_2 | GPIO_PIN_4 | GPIO_PIN_7 | GPIO_PIN_9;
     HAL_GPIO_Init(GPIO_0, &GPIO_InitStruct);
+}
+
+void configure_mem_to_mem_dma(DMA_InitTypeDef* hdma, DMA_ChannelHandleTypeDef* ch) {
+    ch->dma = hdma;
+
+    /* Настройки канала */
+    ch->ChannelInit.Channel = DMA_CHANNEL_1;
+    ch->ChannelInit.Priority = DMA_CHANNEL_PRIORITY_VERY_HIGH;
+
+    ch->ChannelInit.ReadMode = DMA_CHANNEL_MODE_MEMORY;
+    ch->ChannelInit.ReadInc = DMA_CHANNEL_INC_ENABLE;
+    ch->ChannelInit.ReadSize = DMA_CHANNEL_SIZE_BYTE; /* data_len должно быть кратно read_size */
+    ch->ChannelInit.ReadBurstSize = 0;                /* read_burst_size должно быть кратно read_size */
+    ch->ChannelInit.ReadRequest = 0;
+    ch->ChannelInit.ReadAck = DMA_CHANNEL_ACK_DISABLE;
+
+    ch->ChannelInit.WriteMode = DMA_CHANNEL_MODE_MEMORY;
+    ch->ChannelInit.WriteInc = DMA_CHANNEL_INC_ENABLE;
+    ch->ChannelInit.WriteSize = DMA_CHANNEL_SIZE_BYTE; /* data_len должно быть кратно write_size */
+    ch->ChannelInit.WriteBurstSize = 0;                /* write_burst_size должно быть кратно read_size */
+    ch->ChannelInit.WriteRequest = 0;
+    ch->ChannelInit.WriteAck = DMA_CHANNEL_ACK_ENABLE;
 }
 
 void USART_Init()

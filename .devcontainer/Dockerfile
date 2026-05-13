@@ -1,20 +1,26 @@
 FROM ubuntu:24.04
 
 # Install the necessary packages
-RUN apt update
-RUN apt install -y --no-install-recommends \
-    wget \
-    ca-certificates \
-    git \
-    make \
-    cmake \
-    ninja-build \
-    python3 \
-    openocd \
-    picocom \
-    zsh \
-    && \
-    apt-get clean && \
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        ca-certificates \
+        software-properties-common && \
+    add-apt-repository universe -y && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        wget \
+        git \
+        make \
+        cmake \
+        ninja-build \
+        python3 \
+        openocd \
+        picocom \
+        zsh \
+        openssh-client \
+        libusb-1.0-0 \
+        usbutils \
+    && apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
 ENV GIT_SSL_NO_VERIFY=true

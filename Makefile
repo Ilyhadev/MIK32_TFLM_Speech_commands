@@ -25,7 +25,7 @@ $(BUILD_DIR):
 clean:
 	rm -rf $(BUILD_DIR)
 
-flash:
+flash: build_app
 	python3 $(MIK32_UPLOADER_DIR)/mik32_upload.py build/app/base_project.hex --run-openocd \
 	--openocd-exec /usr/bin/openocd \
 	--openocd-target $(MIK32_UPLOADER_DIR)/openocd-scripts/target/mik32.cfg \

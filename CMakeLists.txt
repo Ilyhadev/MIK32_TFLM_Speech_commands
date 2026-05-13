@@ -7,3 +7,4 @@ enable_language(C CXX ASM)
 
 add_subdirectory(hardware)
 add_subdirectory(app)
+add_subdirectory(ml)

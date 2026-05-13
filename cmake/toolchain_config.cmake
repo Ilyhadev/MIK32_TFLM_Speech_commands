@@ -41,13 +41,13 @@ string(CONCAT ASM_FLAGS
 )
 
 set(CMAKE_C_FLAGS_INIT   ${C_FLAGS})
-set(CMAKE_CPP_FLAGS_INIT ${CPP_FLAGS})
+set(CMAKE_CXX_FLAGS_INIT ${CPP_FLAGS})
 set(CMAKE_ASM_FLAGS_INIT ${ASM_FLAGS})
 
 # Set linker flags
 string(CONCAT LINK_FLAGS
     " -Wl,-Map,base_project.map"
-    " -Teeprom.ld"
+    " -Tspifi.ld"
     " -Xlinker --gc-sections"
     " -nostartfiles"
 )
