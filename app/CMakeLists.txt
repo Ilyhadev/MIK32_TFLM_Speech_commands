@@ -6,7 +6,6 @@ add_executable(${APP_NAME}
     debug_io.cc
     mik32_tflm_log.c
     circular_buffer.c
-    riscv-irq.c
     startup.c
 )
 

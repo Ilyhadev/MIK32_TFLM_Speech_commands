@@ -13,7 +13,6 @@ void *__dso_handle __attribute__((weak));
 #include "tflm_wrapper.h"
 #include "kiss_fft_link_test.h"
 #include "circular_buffer.h"
-#include "riscv-irq.h"
 
 #define SYSTEM_FREQ_HZ 32000000UL
 
@@ -29,7 +28,6 @@ static void USART_Init();
 static USART_HandleTypeDef husart0;
 ADC_HandleTypeDef hadc;
 DMA_InitTypeDef hdma;
-DMA_ChannelHandleTypeDef hdma_ch_adc;
 
 TIMER32_HandleTypeDef htimer;
 
@@ -41,79 +39,69 @@ void TMR_Init();
 static void ADC_Init(void);
 static void DMA_Init(void);
 static void configure_interrupts();
-void EPIC_trap_handler();
+
+void configure_mem_to_mem_dma(DMA_InitTypeDef* hdma, DMA_ChannelHandleTypeDef* ch);
 uint16_t adc_buffer[ADC_BUFFER_SIZE];
-DMA_ChannelHandleTypeDef hdma_ch_adc_to_mem;
+DMA_ChannelHandleTypeDef hdma_ch_mem_to_mem;
 
 int main() {
     SystemClock_Config();
     USART_Init();
-    xprintf("0\r\n");
-    TMR_Init();
-    xprintf("1\r\n");
+    xprintf("\r\n--- System Boot ---\r\n");
+    
     ADC_Init();
-    xprintf("2\r\n");
     DMA_Init();
-    xprintf("3\r\n");
-    
-    xprintf("DMA ADC 16kHz sampling started (polling mode)\r\n");
-    
-    uint32_t last_count = 0;
-    int last_ready = 0;
-    
-    while (1) {
-        // // Poll the DMA channel
-        // int is_ready = HAL_DMA_GetChannelReadyStatus(&hdma_ch_adc);
-        // int has_irq = HAL_DMA_GetChannelIrq(&hdma_ch_adc);
-        
-        // // When DMA transfer completes, both ready and IRQ should be set
-        // if (has_irq && !last_ready) {
-        //     dma_interrupt_count++;
-            
-        //     xprintf("Buffer complete #%lu: Sample[0]=%u Ready=%d IRQ=%d\r\n", 
-        //             dma_interrupt_count, adc_buffer[0], is_ready, has_irq);
-            
-        //     // Restart DMA for circular operation
-        //     HAL_DMA_ClearLocalIrq(&hdma);
-        //     HAL_DMA_Start(&hdma_ch_adc, 
-        //                   (void*)&ANALOG_REG->ADC_VALUE,
-        //                   (void*)adc_buffer,
-        //                   ADC_BUFFER_SIZE - 1);
-        // }
-        
-        // last_ready = is_ready;
+    TMR_Init();
+    __HAL_PCC_EPIC_CLK_ENABLE();
+    EPIC->MASK_LEVEL_SET = 1 << (EPIC_LINE_TIMER32_2_S);
+    HAL_IRQ_EnableInterrupts();
 
+    configure_mem_to_mem_dma(&hdma, &hdma_ch_mem_to_mem);
+    
+    xprintf("Starting Free-Running DMA Polling...\r\n");
+
+
+    // MIK32 HAL requires length in BYTES minus 1.
+    uint32_t dma_len = (ADC_BUFFER_SIZE * sizeof(uint16_t)) - 1;
+    uint32_t buffer_count = 0;
+    
+    // Kick off the continuous ADC conversions
+    //HAL_ADC_ContinuousEnable(&hadc);
+    // HAL_ADC_SingleConversionStart(&hadc); // Force the first trigger just in case
+    // 1. Start the DMA transfer
+
+    while (1) {
         xprintf("%d\n\r", TIMER32_0->VALUE);
-        // HAL_DelayMs(100);
+        HAL_DMA_Start(&hdma_ch_mem_to_mem, 
+                      (void*)&ANALOG_REG->ADC_VALUE, 
+                      adc_buffer, 
+                      200);
+        // 2. Wait for the channel to become READY (meaning transfer is done)
+        // HAL_DMA_Wait safely polls the READY bit in CONFIG_STATUS
+        if (HAL_DMA_Wait(&hdma_ch_mem_to_mem, 1000) == HAL_OK) {
+            
+            buffer_count++;
+            
+            // 3. Print the data
+            xprintf("Buffer #%lu full! First: %u, Last: %u\r\n", 
+                    buffer_count, adc_buffer[0], adc_buffer[ADC_BUFFER_SIZE - 1]);
+            
+            // Optional: small delay so you don't flood your terminal too fast
+            for(volatile int i=0; i<1000; i++); 
+            
+        } else {
+            xprintf("DMA Timeout! Transfer got stuck.\r\n");
+        }
+
     }
 }
 
-void EPIC_trap_handler() {
-    int dma_irq_status = HAL_DMA_GetChannelIrq(&hdma_ch_adc);
-    int channel_ready = HAL_DMA_GetChannelReadyStatus(&hdma_ch_adc);
-    int bus_error = HAL_DMA_GetBusError(&hdma_ch_adc);
-    xprintf("sda");
-    if (dma_irq_status) {
-        dma_interrupt_count++;
+void trap_handler() {
+    xprintf("dsa");
+    if (EPIC->RAW_STATUS & (1 << EPIC_LINE_TIMER32_0_S)) {
+        TIMER32_0->INT_CLEAR = TIMER32_INT_OVERFLOW_M;
+         EPIC->CLEAR = EPIC_LINE_TIMER32_0_S;
         
-        HAL_DMA_ClearLocalIrq(&hdma);
-        
-        EPIC->CLEAR = 1 << EPIC_LINE_DMA_S;
-        
-        HAL_DMA_Start(&hdma_ch_adc, 
-                      (void*)&ANALOG_REG->ADC_VALUE,
-                      (void*)adc_buffer,
-                      ADC_BUFFER_SIZE - 1);
-    } else {
-        // Spurious interrupt - no DMA interrupt pending
-        dma_spurious_interrupts++;
-        
-        if (dma_spurious_interrupts <= 5) {
-            xprintf("SPURIOUS IRQ! Ready:%d BusErr:%d IRQ:%d Raw:0x%lx\r\n", 
-                    channel_ready, bus_error, dma_irq_status, EPIC->RAW_STATUS);
-        }
-        HAL_DMA_ClearLocalIrq(&hdma);
-        EPIC->CLEAR = 1 << EPIC_LINE_DMA_S;
     }
 }
 
@@ -137,83 +125,81 @@ void SystemClock_Config(void)
 }
 
 void TMR_Init() {
+    // Enable clock
     PM->CLK_APB_M_SET = PM_CLOCK_APB_M_TIMER32_0_M;
     
     htimer.Instance = TIMER32_0;
     htimer.Top = 2000;
-    htimer.Clock.Prescaler = 0; 
-    htimer.Clock.Source = TIMER32_SOURCE_PRESCALER;  // Use AHB clock
+    htimer.Clock.Prescaler = 0;
+    htimer.Clock.Source = TIMER32_SOURCE_PRESCALER;
     htimer.CountMode = TIMER32_COUNTMODE_FORWARD;
     htimer.State = TIMER32_STATE_ENABLE;
-    htimer.InterruptMask = 0;         // NO CPU interrupt - DMA handles this
-    
+    htimer.InterruptMask = 0;
+
     HAL_Timer32_Init(&htimer);
     HAL_Timer32_Start(&htimer);
 }
 
+// void TMR_Init() {
+//     // Включение тактирования TIMER32_0
+//     PM->CLK_APB_M_SET = PM_CLOCK_APB_M_TIMER32_0_M;
+//     TIMER32_0->ENABLE = 0;
+//     TIMER32_0->TOP = 2000;
+//     TIMER32_0->PRESCALER = 0;
+//     TIMER32_0->CONTROL =
+//         TIMER32_CONTROL_MODE_UP_M | TIMER32_CONTROL_CLOCK_PRESCALER_M;
+//     TIMER32_0->INT_CLEAR = 0xFFFFFFFF;
+//     TIMER32_0->ENABLE = 1;
+//     // Включение прерывания по переполнению
+//     TIMER32_0->INT_MASK = 0;//TIMER32_INT_OVERFLOW_M;
+// }
+
 static void ADC_Init(void) {
     hadc.Instance = ANALOG_REG;
     hadc.Init.Sel = ADC_CHANNEL0;
-    hadc.Init.EXTRef = ADC_EXTREF_OFF;
+    hadc.Init.EXTRef = ADC_EXTREF_OFF; // Use internal 1.2V reference
     hadc.Init.EXTClb = ADC_EXTCLB_CLBREF;
     
     HAL_ADC_Init(&hadc);
 
-    HAL_ADC_Single(&hadc);
+    HAL_ADC_ContinuousEnable(&hadc);
 }
-void DMA_Init() {
+
+void configure_mem_to_mem_dma(DMA_InitTypeDef* hdma, DMA_ChannelHandleTypeDef* ch) {
+    ch->dma = hdma;
+
+    /* Настройки канала */
+    ch->ChannelInit.Channel = DMA_CHANNEL_1;
+    ch->ChannelInit.Priority = DMA_CHANNEL_PRIORITY_VERY_HIGH;
+
+    ch->ChannelInit.ReadMode = DMA_CHANNEL_MODE_MEMORY;
+    ch->ChannelInit.ReadInc = DMA_CHANNEL_INC_ENABLE;
+    ch->ChannelInit.ReadSize = DMA_CHANNEL_SIZE_BYTE; /* data_len должно быть кратно read_size */
+    ch->ChannelInit.ReadBurstSize = 0;                /* read_burst_size должно быть кратно read_size */
+    ch->ChannelInit.ReadRequest = 0;  //DMA_CHANNEL_USART_0_REQUEST;
+    ch->ChannelInit.ReadAck = DMA_CHANNEL_ACK_DISABLE;
+
+    ch->ChannelInit.WriteMode = DMA_CHANNEL_MODE_MEMORY;
+    ch->ChannelInit.WriteInc = DMA_CHANNEL_INC_ENABLE;
+    ch->ChannelInit.WriteSize = DMA_CHANNEL_SIZE_BYTE; /* data_len должно быть кратно write_size */
+    ch->ChannelInit.WriteBurstSize = 0;                /* write_burst_size должно быть кратно read_size */
+    ch->ChannelInit.WriteRequest = 0; //DMA_CHANNEL_USART_0_REQUEST;
+    ch->ChannelInit.WriteAck = DMA_CHANNEL_ACK_ENABLE;
+}
+
+void DMA_Init(void) {
     hdma.Instance = DMA_CONFIG;
-    hdma.CurrentValue = DMA_CURRENT_VALUE_DISABLE;
+    hdma.CurrentValue = DMA_CURRENT_VALUE_ENABLE;
     HAL_DMA_Init(&hdma);
-
-    HAL_DMA_ClearIrq(&hdma);
-
-    HAL_DMA_GlobalIRQEnable(&hdma, DMA_IRQ_ENABLE);
-    
-    hdma_ch_adc.dma = &hdma;
-    hdma_ch_adc.ChannelInit.Channel = DMA_CHANNEL_1;
-    hdma_ch_adc.ChannelInit.Priority = DMA_CHANNEL_PRIORITY_HIGH;
-    
-    hdma_ch_adc.ChannelInit.ReadMode = DMA_CHANNEL_MODE_PERIPHERY;
-    hdma_ch_adc.ChannelInit.ReadInc = DMA_CHANNEL_INC_DISABLE;  // Fixed address
-    hdma_ch_adc.ChannelInit.ReadSize = DMA_CHANNEL_SIZE_HALFWORD;  // 16-bit ADC
-    hdma_ch_adc.ChannelInit.ReadBurstSize = 0;
-    hdma_ch_adc.ChannelInit.ReadRequest = DMA_CHANNEL_TIMER32_0_REQUEST;
-    hdma_ch_adc.ChannelInit.ReadAck = DMA_CHANNEL_ACK_ENABLE;
-
-    hdma_ch_adc.ChannelInit.WriteMode = DMA_CHANNEL_MODE_MEMORY;
-    hdma_ch_adc.ChannelInit.WriteInc = DMA_CHANNEL_INC_ENABLE;
-    hdma_ch_adc.ChannelInit.WriteSize = DMA_CHANNEL_SIZE_HALFWORD;
-    hdma_ch_adc.ChannelInit.WriteBurstSize = 0;
-    hdma_ch_adc.ChannelInit.WriteRequest = 0;
-    hdma_ch_adc.ChannelInit.WriteAck = DMA_CHANNEL_ACK_DISABLE;
-    
-    HAL_DMA_Start(&hdma_ch_adc, 
-                  (void*)&ANALOG_REG->ADC_VALUE,
-                  (void*)adc_buffer,
-                  ADC_BUFFER_SIZE - 1);
-    
-    // Wait a moment for DMA to be ready
-    for (volatile int i = 0; i < 10000; i++) asm("nop");
-    
-    int ready = HAL_DMA_GetChannelReadyStatus(&hdma_ch_adc);
-    int irq = HAL_DMA_GetChannelIrq(&hdma_ch_adc);
-    int err = HAL_DMA_GetBusError(&hdma_ch_adc);
-    
-    xprintf("DMA Start: Ready=%d IRQ=%d BusErr=%d\r\n", ready, irq, err);
-    xprintf("DMA Channel CFG before: 0x%08lx\r\n", hdma.Instance->CHANNELS[1].CFG);
-    xprintf("DMA Status: 0x%08lx\r\n", hdma.Instance->CONFIG_STATUS);
-    
-    xprintf("DMA configured. Channel ready: %d\r\n", HAL_DMA_GetChannelReadyStatus(&hdma_ch_adc));
 }
+
+
 
 void configure_interrupts() {
-    PM->CLK_APB_M_SET = PM_CLOCK_APB_M_EPIC_M;
-    EPIC->MASK_LEVEL_SET = 1 << (EPIC_LINE_TIMER32_0_S);
-
-    riscv_irq_set_handler(RISCV_IRQ_MEI, EPIC_trap_handler);
-    riscv_irq_enable(RISCV_IRQ_MEI);
-    riscv_irq_global_enable();
+    __HAL_PCC_EPIC_CLK_ENABLE();
+    HAL_EPIC_MaskLevelSet(HAL_EPIC_UART_0_MASK);
+    // HAL_USART_RXNE_EnableInterrupt(&husart0);
+    HAL_IRQ_EnableInterrupts();
 }
 
 void HAL_ADC_MspInit(ADC_HandleTypeDef *hadc) {
@@ -271,3 +257,88 @@ void USART_Init()
     husart0.baudrate = 115200;
     HAL_USART_Init(&husart0);
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// void DMA_Init() {
+//     // Initialize DMA controller
+//     hdma.Instance = DMA_CONFIG;
+//     hdma.CurrentValue = DMA_CURRENT_VALUE_DISABLE;
+//     HAL_DMA_Init(&hdma);
+    
+//     // Clear any pending interrupts from before
+//     HAL_DMA_ClearIrq(&hdma);
+    
+//     // Enable global DMA interrupt
+//     HAL_DMA_GlobalIRQEnable(&hdma, DMA_IRQ_ENABLE);
+    
+//     // Configure channel
+//     hdma_ch_adc.dma = &hdma;
+//     hdma_ch_adc.ChannelInit.Channel = DMA_CHANNEL_1;  // Use channel 1
+//     hdma_ch_adc.ChannelInit.Priority = DMA_CHANNEL_PRIORITY_HIGH;
+    
+//     // Source: ADC register (peripheral, no increment)
+//     hdma_ch_adc.ChannelInit.ReadMode = DMA_CHANNEL_MODE_PERIPHERY;
+//     hdma_ch_adc.ChannelInit.ReadInc = DMA_CHANNEL_INC_DISABLE;  // Fixed address
+//     hdma_ch_adc.ChannelInit.ReadSize = DMA_CHANNEL_SIZE_HALFWORD;  // 16-bit ADC
+//     hdma_ch_adc.ChannelInit.ReadBurstSize = 0;
+//     hdma_ch_adc.ChannelInit.ReadRequest = DMA_CHANNEL_TIMER32_0_REQUEST;
+//     // With handshake enabled, DMA waits for each timer pulse (paced transfer)
+//     hdma_ch_adc.ChannelInit.ReadAck = DMA_CHANNEL_ACK_ENABLE;
+    
+//     // Destination: RAM buffer (memory, increment)
+//     hdma_ch_adc.ChannelInit.WriteMode = DMA_CHANNEL_MODE_MEMORY;
+//     hdma_ch_adc.ChannelInit.WriteInc = DMA_CHANNEL_INC_ENABLE;
+//     hdma_ch_adc.ChannelInit.WriteSize = DMA_CHANNEL_SIZE_HALFWORD;
+//     hdma_ch_adc.ChannelInit.WriteBurstSize = 0;
+//     hdma_ch_adc.ChannelInit.WriteRequest = 0;
+//     hdma_ch_adc.ChannelInit.WriteAck = DMA_CHANNEL_ACK_DISABLE;
+    
+//     // Start continuous DMA transfer
+//     HAL_DMA_Start(&hdma_ch_adc, 
+//                   (void*)&ANALOG_REG->ADC_VALUE,
+//                   (void*)adc_buffer,
+//                   ADC_BUFFER_SIZE - 1);
+    
+//     // Wait a moment for DMA to be ready
+//     for (volatile int i = 0; i < 10000; i++) asm("nop");
+    
+//     int ready = HAL_DMA_GetChannelReadyStatus(&hdma_ch_adc);
+//     int irq = HAL_DMA_GetChannelIrq(&hdma_ch_adc);
+//     int err = HAL_DMA_GetBusError(&hdma_ch_adc);
+    
+//     xprintf("DMA Start: Ready=%d IRQ=%d BusErr=%d\r\n", ready, irq, err);
+//     xprintf("DMA Channel CFG before: 0x%08lx\r\n", hdma.Instance->CHANNELS[1].CFG);
+//     xprintf("DMA Status: 0x%08lx\r\n", hdma.Instance->CONFIG_STATUS);
+    
+//     // If still not ready, try enabling the channel explicitly
+//     if (!ready) {
+//         xprintf("Channel not ready! Trying explicit enable...\r\n");
+//         HAL_DMA_ChannelEnable(&hdma_ch_adc);
+        
+//         for (volatile int i = 0; i < 10000; i++) asm("nop");
+        
+//         ready = HAL_DMA_GetChannelReadyStatus(&hdma_ch_adc);
+//         xprintf("After explicit enable: Ready=%d\r\n", ready);
+//         HAL_DMA_Start(&hdma_ch_adc, 
+//                   (void*)&ANALOG_REG->ADC_VALUE,
+//                   (void*)adc_buffer,
+//                   ADC_BUFFER_SIZE - 1);
+//     }
+    
+//     xprintf("DMA configured. Channel ready: %d\r\n", HAL_DMA_GetChannelReadyStatus(&hdma_ch_adc));
+// }
