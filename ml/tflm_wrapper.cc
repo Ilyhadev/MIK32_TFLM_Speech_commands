@@ -109,6 +109,12 @@ int tflm_run(const int8_t* input, size_t input_size) {
     return 0;
 }
 
+int tflm_invoke(void) {
+    if (!initialized || !interpreter) return -1;
+    if (interpreter->Invoke() != kTfLiteOk) return -1;
+    return 0;
+}
+
 int8_t* tflm_input_buffer(size_t* input_size) {
     if (!initialized || !interpreter) {
         return nullptr;
