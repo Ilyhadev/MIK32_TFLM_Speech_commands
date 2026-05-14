@@ -53,40 +53,29 @@ int main() {
     DMA_Init();
     TMR_Init();
     __HAL_PCC_EPIC_CLK_ENABLE();
-    EPIC->MASK_LEVEL_SET = 1 << (EPIC_LINE_TIMER32_2_S);
+    EPIC->MASK_LEVEL_SET = 0xFFFFFFFF;//1 << (EPIC_LINE_TIMER32_0_S);
+    HAL_Timer32_PWM_Start_IT(&htimer, );
     HAL_IRQ_EnableInterrupts();
 
     configure_mem_to_mem_dma(&hdma, &hdma_ch_mem_to_mem);
-    
-    xprintf("Starting Free-Running DMA Polling...\r\n");
-
 
     // MIK32 HAL requires length in BYTES minus 1.
     uint32_t dma_len = (ADC_BUFFER_SIZE * sizeof(uint16_t)) - 1;
     uint32_t buffer_count = 0;
-    
-    // Kick off the continuous ADC conversions
-    //HAL_ADC_ContinuousEnable(&hadc);
-    // HAL_ADC_SingleConversionStart(&hadc); // Force the first trigger just in case
-    // 1. Start the DMA transfer
 
     while (1) {
-        xprintf("%d\n\r", TIMER32_0->VALUE);
+        // xprintf("%d\n\r",TIMER32_0->VALUE);
         HAL_DMA_Start(&hdma_ch_mem_to_mem, 
                       (void*)&ANALOG_REG->ADC_VALUE, 
                       adc_buffer, 
                       200);
-        // 2. Wait for the channel to become READY (meaning transfer is done)
-        // HAL_DMA_Wait safely polls the READY bit in CONFIG_STATUS
         if (HAL_DMA_Wait(&hdma_ch_mem_to_mem, 1000) == HAL_OK) {
             
             buffer_count++;
             
-            // 3. Print the data
             xprintf("Buffer #%lu full! First: %u, Last: %u\r\n", 
                     buffer_count, adc_buffer[0], adc_buffer[ADC_BUFFER_SIZE - 1]);
             
-            // Optional: small delay so you don't flood your terminal too fast
             for(volatile int i=0; i<1000; i++); 
             
         } else {
@@ -101,7 +90,6 @@ void trap_handler() {
     if (EPIC->RAW_STATUS & (1 << EPIC_LINE_TIMER32_0_S)) {
         TIMER32_0->INT_CLEAR = TIMER32_INT_OVERFLOW_M;
          EPIC->CLEAR = EPIC_LINE_TIMER32_0_S;
-        
     }
 }
 
@@ -125,7 +113,6 @@ void SystemClock_Config(void)
 }
 
 void TMR_Init() {
-    // Enable clock
     PM->CLK_APB_M_SET = PM_CLOCK_APB_M_TIMER32_0_M;
     
     htimer.Instance = TIMER32_0;
@@ -134,25 +121,11 @@ void TMR_Init() {
     htimer.Clock.Source = TIMER32_SOURCE_PRESCALER;
     htimer.CountMode = TIMER32_COUNTMODE_FORWARD;
     htimer.State = TIMER32_STATE_ENABLE;
-    htimer.InterruptMask = 0;
+    htimer.InterruptMask = TIMER32_INT_OVERFLOW_M;
 
     HAL_Timer32_Init(&htimer);
     HAL_Timer32_Start(&htimer);
 }
-
-// void TMR_Init() {
-//     // Включение тактирования TIMER32_0
-//     PM->CLK_APB_M_SET = PM_CLOCK_APB_M_TIMER32_0_M;
-//     TIMER32_0->ENABLE = 0;
-//     TIMER32_0->TOP = 2000;
-//     TIMER32_0->PRESCALER = 0;
-//     TIMER32_0->CONTROL =
-//         TIMER32_CONTROL_MODE_UP_M | TIMER32_CONTROL_CLOCK_PRESCALER_M;
-//     TIMER32_0->INT_CLEAR = 0xFFFFFFFF;
-//     TIMER32_0->ENABLE = 1;
-//     // Включение прерывания по переполнению
-//     TIMER32_0->INT_MASK = 0;//TIMER32_INT_OVERFLOW_M;
-// }
 
 static void ADC_Init(void) {
     hadc.Instance = ANALOG_REG;
