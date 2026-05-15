@@ -17,7 +17,6 @@ size_t tflm_model_len_bytes(void);
 
 // Run inference on a preprocessed input (1960 bytes for 49x40 spectrogram)
 int tflm_run(const int8_t* input, size_t input_size);
-/** Invoke only (input tensor already filled, e.g. by feature_extractor into tflm_input_buffer()). */
 int tflm_invoke(void);
 int8_t* tflm_input_buffer(size_t* input_size);
 

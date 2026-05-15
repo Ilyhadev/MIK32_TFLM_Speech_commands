@@ -10,7 +10,8 @@
 namespace {
     // Memory buffers – all zero‑initialized, no constructors
     // 1 byte guarantees AllocateTensors() failure. Keep arena static to avoid heap use.
-    constexpr size_t kArenaSize = 6800;
+    /* ~6724 B used after AllocateTensors(); keep modest headroom for Invoke scratch on 16 KiB parts. */
+    constexpr size_t kArenaSize = 6912;
     alignas(16) static uint8_t tensor_arena[kArenaSize];
 
     alignas(tflite::MicroMutableOpResolver<12>) static uint8_t op_resolver_buf[sizeof(tflite::MicroMutableOpResolver<12>)];
@@ -87,6 +88,10 @@ int tflm_init(void) {
 
 int tflm_last_error(void) {
     return last_error;
+}
+
+size_t tflm_arena_size_bytes(void) {
+    return kArenaSize;
 }
 
 size_t tflm_arena_used_bytes(void) {
