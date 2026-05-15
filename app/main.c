@@ -17,6 +17,7 @@ void *__dso_handle __attribute__((weak));
 
 #include <stddef.h>
 #include <stdint.h>
+#include <inttypes.h>
 #include <string.h>
 
 static void SystemClock_Config(void);
@@ -24,21 +25,21 @@ static void USART_Init(void);
 
 static USART_HandleTypeDef husart0;
 
-#include "spectrogram_kiss.h"
 #include "tflm_wrapper.h"
 
+#ifndef MICRO_SPEECH_ML_SMOKE
+#define MICRO_SPEECH_ML_SMOKE 0
+#endif
+
+#if !MICRO_SPEECH_ML_SMOKE
+#include "spectrogram_kiss.h"
+
 #define ADC_SAMPLE_RATE_HZ 16000U
-/** One block = one DMA completion IRQ (~15/s @ 16 kHz). Fits 16 KiB RAM with TFLM arena + kiss FFT. */
-#define ADC_DMA_HALFWORDS 1024U
+/** ~31 DMA IRQ/s @ 16 kHz; fits 16 KiB with shrunk kiss + arena. */
+#define ADC_DMA_HALFWORDS 256U
 #define ADC_DMA_PACE_TIMER TIMER32_1
 #define ADC_DMA_PACE_REQUEST DMA_CHANNEL_TIMER32_1_REQUEST
 #define LOOP_LOG_INTERVAL 20U
-
-extern char __bss_start[];
-extern char __bss_end[];
-extern char __data_start[];
-extern char __data_end[];
-extern char __sp[];
 
 static void TMR_Init(void);
 static void ADC_Init(void);
@@ -48,8 +49,6 @@ static void dma_irq_init(void);
 static uint32_t adc_pace_timer_hz(void);
 static uint32_t adc_dma_block_timeout_us(void);
 static HAL_StatusTypeDef adc_dma_capture_block(void);
-static void boot_ram_report(void);
-static void ml_log_result(int inv);
 
 static ADC_HandleTypeDef hadc;
 static DMA_InitTypeDef hdma;
@@ -60,23 +59,97 @@ static SpectrogramKissState g_sk;
 
 static volatile uint32_t g_adc_dma_done;
 static volatile uint32_t g_dma_isr_count;
-static volatile uint32_t g_trap_calls;
+#else
+#define LOOP_LOG_INTERVAL 50U
+#endif
 
-static const char *kwd_label(int cls) {
-    static const char *const lab[] = {"silence", "unknown", "yes", "no"};
-    if (cls < 0 || cls > 3) {
-        return "?";
-    }
-    return lab[cls];
-}
+extern char __bss_start[];
+extern char __bss_end[];
+extern char __data_start[];
+extern char __data_end[];
+
+static volatile uint32_t g_trap_calls;
 
 static void boot_trace(const char *msg) {
     xprintf("[BOOT] %s\r\n", msg);
 }
 
+static void boot_ram_report(void) {
+    const uintptr_t ram_base = 0x02000000UL;
+    const uintptr_t ram_end = ram_base + 16384UL;
+    const size_t data_sz = (size_t)(__data_end - __data_start);
+    const size_t bss_sz = (size_t)(__bss_end - __bss_start);
+    const long gap = (long)(ram_end - (uintptr_t)__bss_end);
+
+    xprintf("[RAM] data=%u bss=%u free_to_ram_top=%ld / 16384\r\n", (unsigned)data_sz, (unsigned)bss_sz,
+            (long)gap);
+#if !MICRO_SPEECH_ML_SMOKE
+    xprintf("[RAM] g_sk=%u adc=%u arena=%lu/%lu fft_used=%u\r\n", (unsigned)sizeof(g_sk),
+            (unsigned)sizeof(adc_buffer), (unsigned long)tflm_arena_used_bytes(),
+            (unsigned long)tflm_arena_size_bytes(), (unsigned)spectrogram_kiss_fft_mem_used(&g_sk));
+#else
+    xprintf("[RAM] arena=%lu/%lu (ML smoke, no DMA/FFT)\r\n", (unsigned long)tflm_arena_used_bytes(),
+            (unsigned long)tflm_arena_size_bytes());
+#endif
+}
+
+static int ml_invoke_logged(uint32_t tag) {
+    xprintf("[ML] invoke #%lu (arena free=%lu B) ...\r\n", (unsigned long)tag,
+            (unsigned long)tflm_arena_free_bytes());
+    const uint32_t t0 = HAL_Time_SCR1TIM_Micros();
+    const int err = tflm_invoke();
+    const uint32_t dt = HAL_Time_SCR1TIM_Micros() - t0;
+    if (err != 0) {
+        xprintf("[ML] invoke #%lu FAIL err=%d last=%d dt=%lu us\r\n", (unsigned long)tag, err,
+                tflm_last_error(), (unsigned long)dt);
+        return err;
+    }
+    xprintf("[ML] invoke #%lu OK dt=%lu us\r\n", (unsigned long)tag, (unsigned long)dt);
+    tflm_log_output_scores();
+    return 0;
+}
+
+#if MICRO_SPEECH_ML_SMOKE
+static int run_ml_smoke_loop(void) {
+    size_t in_sz = 0;
+    int8_t *input_tensor = (int8_t *)tflm_input_buffer(&in_sz);
+    if (input_tensor == NULL || in_sz != 1960U) {
+        xprintf("[BOOT] FAIL: input ptr=0x%08lx sz=%lu (want 1960)\r\n",
+                (unsigned long)(uintptr_t)input_tensor, (unsigned long)in_sz);
+        while (1) {
+        }
+    }
+    memset(input_tensor, 1, in_sz);
+    xprintf("[BOOT] ML smoke: filled %lu B with 0x01\r\n", (unsigned long)in_sz);
+
+    boot_trace("5: before invoke #1");
+    if (ml_invoke_logged(1U) != 0) {
+        xprintf("[BOOT] first invoke failed; halting\r\n");
+        while (1) {
+        }
+    }
+
+    uint32_t inv = 2;
+    while (1) {
+        for (volatile uint32_t d = 0; d < 5000000U; d++) {
+        }
+        (void)ml_invoke_logged(inv++);
+        if ((inv % LOOP_LOG_INTERVAL) == 0U) {
+            xprintf("[LOOP] smoke inv=%lu traps=%lu\r\n", (unsigned long)inv, (unsigned long)g_trap_calls);
+        }
+    }
+    return 0;
+}
+#endif
+
 void app_trap_handler(void) {
     g_trap_calls++;
+#if MICRO_SPEECH_ML_SMOKE
+    /* Do not xprintf here: trap stack is only 128 B. */
+    return;
+#endif
 
+#if !MICRO_SPEECH_ML_SMOKE
     if ((EPIC->RAW_STATUS & HAL_EPIC_DMA_MASK) == 0U) {
         return;
     }
@@ -87,22 +160,7 @@ void app_trap_handler(void) {
         HAL_DMA_ClearLocalIrq(&hdma);
         HAL_EPIC_Clear(HAL_EPIC_DMA_MASK);
     }
-}
-
-static void boot_ram_report(void) {
-    const uintptr_t ram_base = 0x02000000UL;
-    const uintptr_t ram_end = ram_base + 16384UL;
-    const size_t data_sz = (size_t)(__data_end - __data_start);
-    const size_t bss_sz = (size_t)(__bss_end - __bss_start);
-    const size_t stack_sz = (size_t)(ram_end - (uintptr_t)&__sp);
-    const size_t bss_end_off = (size_t)((uintptr_t)__bss_end - ram_base);
-
-    xprintf("[RAM] data=%u bss=%u stack~=%u (decl) total~=%u / 16384\r\n", (unsigned)data_sz,
-            (unsigned)bss_sz, (unsigned)stack_sz, (unsigned)(data_sz + bss_sz + stack_sz));
-    xprintf("[RAM] bss_end=0x%08lx gap_to_stack=%ld B\r\n", (unsigned long)bss_end_off,
-            (long)(ram_end - stack_sz) - (long)bss_end_off);
-    xprintf("[RAM] g_sk=%u adc=%u arena=%u fft_used=%u\r\n", (unsigned)sizeof(g_sk),
-            (unsigned)sizeof(adc_buffer), (unsigned)tflm_arena_used_bytes(), (unsigned)spectrogram_kiss_fft_mem_used(&g_sk));
+#endif
 }
 
 int main(void) {
@@ -110,6 +168,28 @@ int main(void) {
     USART_Init();
     HAL_Time_SCR1TIM_Init();
     boot_trace("0: SystemClock + USART OK");
+
+#if MICRO_SPEECH_ML_SMOKE
+    if (tflm_init() != 0) {
+        xprintf("[BOOT] FAIL: tflm_init err=%d\r\n", tflm_last_error());
+        while (1) {
+        }
+    }
+    boot_trace("1: after tflm_init");
+    tflm_log_tensors();
+    boot_trace("2: after log_tensors");
+    boot_ram_report();
+    boot_trace("3: after ram_report");
+    xprintf("micro_speech: ML_SMOKE (no DMA/FFT)\r\n");
+    boot_trace("4: enter smoke loop");
+    (void)run_ml_smoke_loop();
+#else
+    if (tflm_init() != 0) {
+        xprintf("[BOOT] FAIL: tflm_init err=%d\r\n", tflm_last_error());
+        while (1) {
+        }
+    }
+    tflm_log_tensors();
 
     ADC_Init();
     DMA_Init();
@@ -127,24 +207,19 @@ int main(void) {
         }
     }
 
-    if (tflm_init() != 0) {
-        xprintf("[BOOT] FAIL: tflm_init err=%d\r\n", tflm_last_error());
-        while (1) {
-        }
-    }
-
     size_t in_sz = 0;
-    int8_t *input_tensor = tflm_input_buffer(&in_sz);
+    int8_t *input_tensor = (int8_t *)tflm_input_buffer(&in_sz);
     if (input_tensor == NULL || in_sz != (size_t)SK_FEATURE_COUNT) {
-        xprintf("[BOOT] FAIL: input ptr=%p sz=%lu want %u\r\n", (void *)input_tensor, (unsigned long)in_sz,
-                (unsigned)SK_FEATURE_COUNT);
+        xprintf("[BOOT] FAIL: input ptr=0x%08lx sz=%lu want %u\r\n",
+                (unsigned long)(uintptr_t)input_tensor, (unsigned long)in_sz, (unsigned)SK_FEATURE_COUNT);
         while (1) {
         }
     }
 
     boot_ram_report();
-    xprintf("micro_speech: blk=%u @ %u Hz, arena %lu/%u B used\r\n", (unsigned)ADC_DMA_HALFWORDS,
-            (unsigned)ADC_SAMPLE_RATE_HZ, (unsigned long)tflm_arena_used_bytes(), (unsigned)6912U);
+    xprintf("micro_speech: blk=%u @ %u Hz, arena %lu/%lu B\r\n", (unsigned)ADC_DMA_HALFWORDS,
+            (unsigned)ADC_SAMPLE_RATE_HZ, (unsigned long)tflm_arena_used_bytes(),
+            (unsigned long)tflm_arena_size_bytes());
     xprintf("[BOOT] cap ~%lu us/blk expect\r\n",
             (unsigned long)((ADC_DMA_HALFWORDS * 1000000UL) / ADC_SAMPLE_RATE_HZ));
     boot_trace("enter loop");
@@ -170,45 +245,37 @@ int main(void) {
         }
         const uint32_t proc_us = HAL_Time_SCR1TIM_Micros() - proc0;
 
-        if ((blocks % LOOP_LOG_INTERVAL) == 0U) {
+        if (blocks <= 3U || (blocks % LOOP_LOG_INTERVAL) == 0U) {
             const uint32_t now_us = HAL_Time_SCR1TIM_Micros();
             const uint32_t span_us = now_us - last_log_us;
             last_log_us = now_us;
             const uint32_t blk_per_s_x10 =
-                (span_us > 0U) ? (LOOP_LOG_INTERVAL * 10000000UL / span_us) : 0U;
+                (span_us > 0U && blocks > 1U) ? (LOOP_LOG_INTERVAL * 10000000UL / span_us) : 0U;
             const uint32_t hz_audio = (blk_per_s_x10 * ADC_DMA_HALFWORDS) / 10U;
 
             xprintf("[LOOP] blk=%lu cap=%lu proc=%lu slices=%u ready=%u\r\n", (unsigned long)blocks,
                     (unsigned long)cap_us, (unsigned long)proc_us, (unsigned)spectrogram_kiss_slice_count(&g_sk),
                     spectrogram_kiss_ready(&g_sk) ? 1U : 0U);
-            xprintf("[LOOP] ~%lu.%lu blk/s ~%lu Hz isr=%lu\r\n", (unsigned long)(blk_per_s_x10 / 10U),
-                    (unsigned long)(blk_per_s_x10 % 10U), (unsigned long)hz_audio,
-                    (unsigned long)g_dma_isr_count);
+            if (blocks > 1U) {
+                xprintf("[LOOP] ~%lu.%lu blk/s ~%lu Hz isr=%lu\r\n", (unsigned long)(blk_per_s_x10 / 10U),
+                        (unsigned long)(blk_per_s_x10 % 10U), (unsigned long)hz_audio,
+                        (unsigned long)g_dma_isr_count);
+            }
         }
 
         const uint32_t fseq = spectrogram_kiss_frame_seq(&g_sk);
         if (spectrogram_kiss_ready(&g_sk) && fseq > last_infer_frame_seq) {
             last_infer_frame_seq = fseq;
             ml_invocations++;
-            xprintf("[ML] invoke #%lu fseq=%lu\r\n", (unsigned long)ml_invocations, (unsigned long)fseq);
-
             HAL_IRQ_DisableInterrupts();
-            if (tflm_invoke() != 0) {
-                HAL_IRQ_EnableInterrupts();
-                xprintf("[ML] invoke failed err=%d\r\n", tflm_last_error());
-                continue;
-            }
-            ml_log_result(ml_invocations);
+            (void)ml_invoke_logged(ml_invocations);
             HAL_IRQ_EnableInterrupts();
         }
     }
+#endif
 }
 
-static void ml_log_result(int inv) {
-    const int cls = tflm_get_result();
-    xprintf("[ML] #%d -> %s\r\n", inv, kwd_label(cls));
-}
-
+#if !MICRO_SPEECH_ML_SMOKE
 static HAL_StatusTypeDef adc_dma_capture_block(void) {
     const uint32_t dma_len_bytes = (uint32_t)(ADC_DMA_HALFWORDS * sizeof(uint16_t)) - 1U;
 
@@ -299,6 +366,7 @@ static void DMA_Init(void) {
     hdma.CurrentValue = DMA_CURRENT_VALUE_ENABLE;
     HAL_DMA_Init(&hdma);
 }
+#endif
 
 void SystemClock_Config(void) {
     PCC_InitTypeDef PCC_OscInit = {0};

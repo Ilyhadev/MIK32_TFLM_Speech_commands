@@ -9,19 +9,23 @@
 extern "C" {
 #endif
 
-// Initialize model and interpreter. Returns 0 on success.
 int tflm_init(void);
 int tflm_last_error(void);
 size_t tflm_arena_used_bytes(void);
+size_t tflm_arena_size_bytes(void);
+size_t tflm_arena_free_bytes(void);
 size_t tflm_model_len_bytes(void);
 
-// Run inference on a preprocessed input (1960 bytes for 49x40 spectrogram)
 int tflm_run(const int8_t* input, size_t input_size);
 int tflm_invoke(void);
-int8_t* tflm_input_buffer(size_t* input_size);
+/** Model input tensor (int8 features); NULL if not initialized. */
+void* tflm_input_buffer(size_t* input_size);
+/** Bytes per input element (1 for int8/uint8 feature maps). */
+size_t tflm_input_element_size(void);
 
-// Get the class index (0 = silence, 1 = unknown, 2 = yes, 3 = no)
 int tflm_get_result(void);
+void tflm_log_tensors(void);
+void tflm_log_output_scores(void);
 
 size_t tflm_input_bytes(void);
 
@@ -30,4 +34,3 @@ size_t tflm_input_bytes(void);
 #endif
 
 #endif // TFLM_WRAPPER_H
-

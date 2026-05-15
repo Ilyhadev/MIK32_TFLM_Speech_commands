@@ -20,6 +20,8 @@ string(CONCAT COMMON_FLAGS
     " -Wall"
     " -fsigned-char -ffunction-sections"
     " -DMIK32V2"
+    " -DTF_LITE_STATIC_MEMORY"
+    " -DTF_LITE_DISABLE_X86_NEON"
 )
 
 string(CONCAT C_FLAGS

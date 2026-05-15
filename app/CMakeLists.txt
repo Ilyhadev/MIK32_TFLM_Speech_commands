@@ -9,22 +9,31 @@ add_executable(${APP_NAME}
     startup.c
 )
 
-target_link_libraries(${APP_NAME}
-    PRIVATE
-        mik32_hal
-        tflm_wrapper
-        model_data
-        spectrogram_kiss
-)
+set(_app_libs mik32_hal tflm_wrapper model_data)
+if(NOT MICRO_SPEECH_ML_SMOKE)
+    list(APPEND _app_libs spectrogram_kiss)
+endif()
 
+target_link_libraries(${APP_NAME} PRIVATE ${_app_libs})
+
+target_compile_definitions(${APP_NAME} PRIVATE
+    MICRO_SPEECH_ML_SMOKE=$<IF:$<BOOL:${MICRO_SPEECH_ML_SMOKE}>,1,0>
+)
 
 target_link_directories(${APP_NAME} PRIVATE
     ${CMAKE_SOURCE_DIR}/hardware/mik32v2-shared/ldscripts
 )
 
-# 16 KiB SRAM: keep stack modest so 2 KiB ADC + kiss + TFLM arena fit in .bss
+# Invoke() uses deep C stack; 512 B caused AllocateTensors corruption in full builds.
+if(MICRO_SPEECH_ML_SMOKE)
+    # Invoke() + xprintf need headroom; 3072 B hung after probe OK at init depth.
+    set(_stack_size 5120)
+else()
+    set(_stack_size 896)
+endif()
+
 target_link_options(${APP_NAME} PRIVATE
-    "LINKER:--defsym=__stack_size=768"
+    "LINKER:--defsym=__stack_size=${_stack_size}"
 )
 
 # Convert output to hex and binary
