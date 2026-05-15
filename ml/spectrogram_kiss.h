@@ -16,8 +16,8 @@ extern "C" {
 #define SK_SLICES 49U
 #define SK_FEATURE_COUNT (SK_BINS * SK_SLICES)
 
-/** Max bytes for kiss_fftr_alloc(512,0,…); runtime probe ~2836 on MIK32. */
-#define SK_FFT_MEM_MAX 3072U
+/** kiss_fftr_alloc(512) uses ~2836 B on MIK32; keep tight for 16 KiB RAM / stack headroom. */
+#define SK_FFT_MEM_MAX 2880U
 
 typedef struct {
     int16_t frame_buffer[SK_FRAME_LEN];

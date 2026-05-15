@@ -11,17 +11,13 @@
 
 extern "C" void xprintf(const char *fmt, ...);
 
-#ifndef MICRO_SPEECH_PROBE_INVOKE_IN_INIT
-#define MICRO_SPEECH_PROBE_INVOKE_IN_INIT 0
-#endif
-
 namespace {
     /* micro_speech_quantized: 49 x 40 int8 features, 4 int8 class scores */
     constexpr int kFeatureBytes = 1960;
     constexpr int kCategoryBytes = 4;
 
-    /* 6716 B after AllocateTensors(); Invoke needs extra temp space in the same arena. */
-    constexpr size_t kArenaSize = 7936;
+    /* ~6804 B used after AllocateTensors(); keep minimal margin in 16 KiB RAM. */
+    constexpr size_t kArenaSize = 6848;
     alignas(16) static uint8_t tensor_arena[kArenaSize];
 
     alignas(tflite::MicroMutableOpResolver<4>) static uint8_t op_resolver_buf[sizeof(tflite::MicroMutableOpResolver<4>)];
@@ -107,35 +103,10 @@ static int cache_tensor_ptrs(void) {
     arena_used_cached = interpreter->arena_used_bytes();
     arena_free_cached = (arena_used_cached < kArenaSize) ? (kArenaSize - arena_used_cached) : 0U;
 
-    xprintf("[TFLM] cached in bytes=%d type=%s(%d) elt=%u data=0x%08x\r\n", input_bytes,
-            tflm_type_name(input_type), (int)input_type, (unsigned)input_element_size,
-            (unsigned)(uintptr_t)input_data);
-    xprintf("[TFLM] cached out bytes=%d type=%s(%d) elt=%u data=0x%08x\r\n", output_bytes,
-            tflm_type_name(output_type), (int)output_type, (unsigned)output_element_size,
-            (unsigned)(uintptr_t)output_data);
+    xprintf("[TFLM] init arena %u/%u in=%d out=%d\r\n", (unsigned)arena_used_cached,
+            (unsigned)kArenaSize, input_bytes, output_bytes);
     return 0;
 }
-
-#if MICRO_SPEECH_PROBE_INVOKE_IN_INIT
-static int probe_invoke_at_init_depth(const char *tag) {
-    xprintf("[TFLM] %s: probe Invoke (init stack depth)...\r\n", tag);
-    const TfLiteStatus st = interpreter->Invoke();
-    if (st != kTfLiteOk) {
-        xprintf("[TFLM] %s: probe Invoke FAIL st=%d\r\n", tag, (int)st);
-        return -31;
-    }
-    xprintf("[TFLM] %s: probe Invoke OK", tag);
-    if (output_data != nullptr && output_bytes == kCategoryBytes) {
-        xprintf(" scores");
-        const int8_t* scores = static_cast<const int8_t*>(output_data);
-        for (int i = 0; i < kCategoryBytes; i++) {
-            xprintf(" %d", (int)scores[i]);
-        }
-    }
-    xprintf("\r\n");
-    return 0;
-}
-#endif
 
 extern "C" {
 
@@ -190,17 +161,8 @@ int tflm_init(void) {
         return last_error;
     }
 
-#if MICRO_SPEECH_PROBE_INVOKE_IN_INIT
-    if (probe_invoke_at_init_depth("init") != 0) {
-        last_error = -31;
-        return last_error;
-    }
-#endif
-
     initialized = true;
     last_error = 0;
-    xprintf("[TFLM] init OK arena_used=%u free=%u\r\n", (unsigned)arena_used_cached,
-            (unsigned)arena_free_cached);
     return 0;
 }
 
@@ -269,22 +231,12 @@ int tflm_run(const int8_t* input, size_t input_size) {
     return 0;
 }
 
-static uintptr_t read_sp(void) {
-    uintptr_t sp = 0;
-#if defined(__riscv)
-    __asm__ volatile("mv %0, sp" : "=r"(sp));
-#endif
-    return sp;
-}
-
 int tflm_invoke(void) {
     if (!initialized || !interpreter) {
         last_error = -1;
         return -1;
     }
-    xprintf("[TFLM] Invoke enter sp=0x%08x\r\n", (unsigned)read_sp());
     const TfLiteStatus st = interpreter->Invoke();
-    xprintf("[TFLM] Invoke done st=%d sp=0x%08x\r\n", (int)st, (unsigned)read_sp());
     if (st != kTfLiteOk) {
         last_error = -30 - (int)st;
         return -1;

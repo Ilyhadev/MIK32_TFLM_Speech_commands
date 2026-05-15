@@ -9,11 +9,6 @@ set(TFLM_MICROLITE_LIB "${TFLM_GEN_ROOT}/lib/libtensorflow-microlite.a")
 
 add_library(tflm_wrapper STATIC tflm_wrapper.cc)
 
-# Probe runs Invoke inside tflm_init; keep off to avoid extra stack/arena use before smoke.
-if(MICRO_SPEECH_ML_SMOKE AND MICRO_SPEECH_PROBE_INVOKE_IN_INIT)
-    target_compile_definitions(tflm_wrapper PRIVATE MICRO_SPEECH_PROBE_INVOKE_IN_INIT=1)
-endif()
-
 target_include_directories(tflm_wrapper PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_SOURCE_DIR}/third_party/tflite-micro
