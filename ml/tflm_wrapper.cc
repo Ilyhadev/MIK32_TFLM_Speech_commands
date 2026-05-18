@@ -16,13 +16,20 @@ namespace {
     constexpr int kFeatureBytes = 1960;
     constexpr int kCategoryBytes = 4;
 
-    /* ~6804 B used after AllocateTensors(); keep minimal margin in 16 KiB RAM. */
-    constexpr size_t kArenaSize = 6812;
-    alignas(16) static uint8_t tensor_arena[kArenaSize];
+    /*
+     * One RAM slab time-multiplexed:
+     *   RECORD  — entire shot_pool (~7+ KiB) is DMA PCM (arena + op + interpreter slots).
+     *   INFER   — shot_pool[0..kArenaBytes) is the tensor arena; tail holds op + interpreter.
+     * kArenaBytes is the minimum AllocateTensors() needs for this model (do not shrink).
+     */
+    constexpr size_t kArenaBytes = 6812;
+    constexpr size_t kOpStorageBytes = sizeof(tflite::MicroMutableOpResolver<4>);
+    constexpr size_t kInterpStorageBytes = sizeof(tflite::MicroInterpreter);
+    constexpr size_t kShotPoolBytes = kArenaBytes + kOpStorageBytes + kInterpStorageBytes;
 
-    alignas(tflite::MicroMutableOpResolver<4>) static uint8_t op_resolver_buf[sizeof(tflite::MicroMutableOpResolver<4>)];
-
-    alignas(tflite::MicroInterpreter) static uint8_t interpreter_buf[sizeof(tflite::MicroInterpreter)];
+    alignas(16) static uint8_t shot_pool[kShotPoolBytes];
+    static uint8_t *const kOpStorage = shot_pool + kArenaBytes;
+    static uint8_t *const kInterpStorage = shot_pool + kArenaBytes + kOpStorageBytes;
 
     static tflite::MicroMutableOpResolver<4>* op_resolver = nullptr;
     static tflite::MicroInterpreter* interpreter = nullptr;
@@ -103,14 +110,10 @@ static int cache_tensor_ptrs(void) {
     }
 
     arena_used_cached = interpreter->arena_used_bytes();
-    arena_free_cached = (arena_used_cached < kArenaSize) ? (kArenaSize - arena_used_cached) : 0U;
+    arena_free_cached = (arena_used_cached < kArenaBytes) ? (kArenaBytes - arena_used_cached) : 0U;
     output_scale = out->params.scale;
     output_zero_point = out->params.zero_point;
 
-    xprintf("[TFLM] init arena %u/%u in=%d out=%d\r\n", (unsigned)arena_used_cached,
-            (unsigned)kArenaSize, input_bytes, output_bytes);
-    xprintf("[TFLM] out zp=%d scale~%lu\r\n", output_zero_point,
-            (unsigned long)(output_scale * 1000000.0f));
     return 0;
 }
 
@@ -121,6 +124,7 @@ int tflm_init(void) {
         last_error = 0;
         return 0;
     }
+    std::memset(shot_pool, 0, kShotPoolBytes);
     last_error = 0;
     const unsigned char* model_tflite = model_data_ptr();
     const unsigned int model_tflite_len = model_data_len();
@@ -145,20 +149,20 @@ int tflm_init(void) {
         return last_error;
     }
 
-    op_resolver = new (op_resolver_buf) tflite::MicroMutableOpResolver<4>();
+    op_resolver = new (kOpStorage) tflite::MicroMutableOpResolver<4>();
     if (op_resolver->AddReshape() != kTfLiteOk) return (last_error = -24);
     if (op_resolver->AddFullyConnected() != kTfLiteOk) return (last_error = -22);
     if (op_resolver->AddDepthwiseConv2D() != kTfLiteOk) return (last_error = -21);
     if (op_resolver->AddSoftmax() != kTfLiteOk) return (last_error = -23);
 
-    interpreter = new (interpreter_buf) tflite::MicroInterpreter(
-        model, *op_resolver, tensor_arena, kArenaSize);
+    interpreter = new (kInterpStorage) tflite::MicroInterpreter(
+        model, *op_resolver, shot_pool, kArenaBytes);
 
     const TfLiteStatus alloc_st = interpreter->AllocateTensors();
     if (alloc_st != kTfLiteOk) {
         last_error = -14;
         xprintf("[TFLM] AllocateTensors failed status=%d arena_used=%u/%u\r\n", (int)alloc_st,
-                (unsigned)interpreter->arena_used_bytes(), (unsigned)kArenaSize);
+                (unsigned)interpreter->arena_used_bytes(), (unsigned)kArenaBytes);
         return last_error;
     }
 
@@ -177,7 +181,55 @@ int tflm_last_error(void) {
 }
 
 size_t tflm_arena_size_bytes(void) {
-    return kArenaSize;
+    return kArenaBytes;
+}
+
+extern "C" void *tflm_arena_scratch(size_t *out_bytes) {
+    if (out_bytes != nullptr) {
+        *out_bytes = kShotPoolBytes;
+    }
+    return shot_pool;
+}
+
+size_t tflm_preinit_pool_bytes(void) {
+    return kShotPoolBytes;
+}
+
+size_t tflm_shot_pool_pcm_bytes(void) {
+    return kShotPoolBytes;
+}
+
+int tflm_preinit_scratch_region(unsigned index, void **out_ptr, size_t *out_bytes) {
+    if (out_ptr == nullptr || out_bytes == nullptr) {
+        return -1;
+    }
+    if (index != 0U) {
+        return -1;
+    }
+    *out_ptr = shot_pool;
+    *out_bytes = kShotPoolBytes;
+    return 0;
+}
+
+void tflm_reset(void) {
+    if (interpreter != nullptr) {
+        interpreter->~MicroInterpreter();
+        interpreter = nullptr;
+    }
+    if (op_resolver != nullptr) {
+        op_resolver->~MicroMutableOpResolver<4>();
+        op_resolver = nullptr;
+    }
+    std::memset(kOpStorage, 0, kOpStorageBytes);
+    std::memset(kInterpStorage, 0, kInterpStorageBytes);
+    initialized = false;
+    input_data = nullptr;
+    output_data = nullptr;
+    input_bytes = 0;
+    output_bytes = 0;
+    arena_used_cached = 0;
+    arena_free_cached = 0;
+    last_error = 0;
 }
 
 size_t tflm_arena_used_bytes(void) {

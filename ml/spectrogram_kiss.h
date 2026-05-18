@@ -18,6 +18,10 @@ extern "C" {
 #define SK_FEATURE_COUNT (SK_BINS * SK_SLICES)
 /** Model trained on 49×20 ms ≈ 1 s; infer only when the sliding window is full. */
 #define SK_MIN_SLICES_INFER SK_SLICES
+/** Columns crossfaded pad<->speech after pack (0 = off). */
+#define SK_EDGE_BLEND_COLS 10U
+/** Last speech column when packing short windows (cols after this are pad). */
+#define SK_SPEECH_END_COL 42U
 
 /** kiss_fftr_alloc(512) uses ~2836 B on MIK32; keep tight for 16 KiB RAM / stack headroom. */
 #define SK_FFT_MEM_MAX 2880U
@@ -26,6 +30,8 @@ typedef struct {
     uint16_t write_index;
     uint16_t samples_since_last_frame;
     uint16_t slice_count;
+    /** Column index of oldest slice when slice_count >= SK_SLICES (ring buffer). */
+    uint16_t oldest_col;
     uint32_t frame_seq;
     int16_t dc_estimate;
     uint16_t adc_midpoint;
@@ -45,7 +51,13 @@ typedef struct {
 } SpectrogramKissState;
 
 void spectrogram_kiss_init(SpectrogramKissState *st);
+/** Use training default pad column (no quiet FFT cal required). */
+void spectrogram_kiss_set_default_pad(SpectrogramKissState *st);
 bool spectrogram_kiss_fft_ready(const SpectrogramKissState *st);
+/** Drop FFT cfg so fft_mem[] can hold PCM during RECORD; call ensure_fft before PROCESS. */
+void spectrogram_kiss_release_fft(SpectrogramKissState *st);
+/** Re-allocate kiss FFT in fft_mem after RECORD (preserves cal/pad/noise). */
+bool spectrogram_kiss_ensure_fft(SpectrogramKissState *st);
 uint32_t spectrogram_kiss_fft_mem_used(const SpectrogramKissState *st);
 
 void spectrogram_kiss_set_cal(SpectrogramKissState *st, uint16_t adc_midpoint, int16_t mic_gain_q8);
@@ -66,12 +78,23 @@ void spectrogram_kiss_push_adc(SpectrogramKissState *st, uint16_t adc12_sample, 
 void spectrogram_kiss_push_adc_block(SpectrogramKissState *st, const uint16_t *adc12_block, size_t count,
                                      int8_t *feature_window);
 
+/** Host / WAV validation: int16 PCM already centered (bypasses adc12_to_pcm16). */
+void spectrogram_kiss_push_pcm16_block(SpectrogramKissState *st, const int16_t *pcm_block, size_t count,
+                                       int8_t *feature_window);
+
 /**
  * Copy feature_window into out (1960 int8) with leading silence columns so the
  * most recent slice_count columns align with training layout (recent speech at end).
  */
 void spectrogram_kiss_pack_for_inference(const SpectrogramKissState *st, const int8_t *feature_window,
                                        uint16_t slice_count, int8_t *out);
+
+/**
+ * Write 49×40 features into out in training order (oldest column first).
+ * feature_window holds the internal ring (see oldest_col); may equal out.
+ */
+void spectrogram_kiss_write_inference_features(const SpectrogramKissState *st, const int8_t *feature_window,
+                                             int8_t *out);
 
 void spectrogram_kiss_last_column_minmax(const int8_t *feature_window, int8_t *out_min, int8_t *out_max);
 
@@ -80,6 +103,19 @@ bool spectrogram_kiss_ready(const SpectrogramKissState *st);
 uint16_t spectrogram_kiss_slice_count(const SpectrogramKissState *st);
 
 uint32_t spectrogram_kiss_frame_seq(const SpectrogramKissState *st);
+
+/**
+ * Poll ADC into an internal buffer for duration_ms (speak during this window).
+ * Returns number of samples stored (capped by internal buffer size).
+ */
+uint16_t spectrogram_kiss_coop_poll_ms(uint32_t duration_ms);
+
+/**
+ * Feed coop-buffer samples through the frontend (max_hops FFTs).
+ * Returns how many extra spectrogram slices were produced.
+ */
+uint16_t spectrogram_kiss_drain_coop_hops(SpectrogramKissState *st, int8_t *feature_window,
+                                          uint16_t max_hops);
 
 #ifdef __cplusplus
 }

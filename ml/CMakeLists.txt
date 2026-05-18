@@ -43,6 +43,8 @@ set(SIGNAL_SRC
 add_library(spectrogram_kiss STATIC spectrogram_kiss.cc ${SIGNAL_SRC})
 target_include_directories(spectrogram_kiss PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(spectrogram_kiss PRIVATE
+    ${CMAKE_SOURCE_DIR}/hardware/mik32v2-shared/include
+    ${CMAKE_SOURCE_DIR}/hardware/mik32v2-shared/periphery
     ${TFLM_ROOT}
     ${TFLM_ROOT}/tensorflow/lite/micro/tools/make/downloads/kissfft
     ${TFLM_ROOT}/tensorflow/lite/micro/tools/make/downloads/kissfft/tools

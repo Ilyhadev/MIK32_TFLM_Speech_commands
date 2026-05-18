@@ -13,346 +13,363 @@ void *__dso_handle __attribute__((weak));
 #include <stdint.h>
 #include <string.h>
 
+#include "adc_ram_capture.h"
 #include "spectrogram_kiss.h"
 #include "tflm_wrapper.h"
 
-#define ADC_SAMPLE_RATE_HZ 16000U
-#define ADC_DMA_PACE_TIMER TIMER32_1
-#define ADC_DMA_PACE_REQUEST DMA_CHANNEL_TIMER32_1_REQUEST
-#define LOOP_LOG_INTERVAL 20U
-/** Match SK_FRAME_HOP: one DMA block = one 20 ms hop when capture keeps up. */
-#define ADC_DMA_HALFWORDS SK_FRAME_HOP
-#define ML_LOG_SCORES_MAX 6U
-/** Must match app/CMakeLists.txt LINKER:__stack_size. */
-#define APP_STACK_BYTES 1280U
-/** Two 20 ms blocks while quiet: ADC midpoint + spectrogram pad column. */
-#define QUIET_CAL_BLOCKS 2U
-
-static void SystemClock_Config(void);
-static void USART_Init(void);
-static void TMR_Init(void);
-static void ADC_Init(void);
-static void DMA_Init(void);
-static void configure_adc_timer_dma(DMA_ChannelHandleTypeDef *ch);
-static uint32_t adc_pace_timer_hz(void);
-static uint32_t adc_dma_block_timeout_us(void);
-static uint32_t adc_dma_expected_cap_us(void);
-static HAL_StatusTypeDef adc_dma_capture_block(void);
-static void boot_ram_report(void);
-static void ml_log_result(int inv);
-static void adc_buffer_minmax(uint16_t *out_min, uint16_t *out_max);
-static uint16_t adc_capture_quiet_and_cal(SpectrogramKissState *sk);
+#define SAMPLE_RATE_HZ 16000U
+#define DMA_TIMER TIMER32_1
+#define DMA_REQ DMA_CHANNEL_TIMER32_1_REQUEST
+#define DMA_SAMPLES (SK_FRAME_HOP * 2U)
+#define HOPS_PER_DMA_BLOCK (DMA_SAMPLES / SK_FRAME_HOP)
+#define MAX_LIVE_HOPS 16U
+#define LOOP_LOG_EVERY 20U
+#define QUIET_BLOCKS 20U
+#define TRIGGER_PK 300U
+#define MIC_GAIN_Q8 48
 
 static USART_HandleTypeDef husart0;
 static ADC_HandleTypeDef hadc;
 static DMA_InitTypeDef hdma;
 static TIMER32_HandleTypeDef htimer;
-static uint16_t adc_buffer[ADC_DMA_HALFWORDS];
-static DMA_ChannelHandleTypeDef hdma_ch_adc;
-static SpectrogramKissState g_sk;
+static DMA_ChannelHandleTypeDef hdma_ch;
+static uint16_t dma_buf[DMA_SAMPLES];
+static SpectrogramKissState sk;
+static int8_t feat_live[MAX_LIVE_HOPS * SK_BINS];
+static uint8_t shot_fft_stash_blk;
+static bool shot_fft_stashed;
 
-static volatile uint32_t g_adc_dma_done;
+static volatile uint32_t dma_done;
+static uint16_t adc_mid = 1630U;
+static uint16_t pk_win_max;
 
-extern char __bss_start[];
-extern char __bss_end[];
-extern char __data_start[];
-extern char __data_end[];
-extern char __sp;
-
-static const char *kwd_label(int cls) {
-    static const char *const lab[] = {"silence", "unknown", "yes", "no"};
-    if (cls < 0 || cls > 3) {
-        return "?";
-    }
-    return lab[cls];
+static const char *cls_name(int c) {
+    static const char *const n[] = {"silence", "unknown", "yes", "no"};
+    return (c >= 0 && c <= 3) ? n[c] : "?";
 }
 
-static void boot_ram_report(void) {
-    const uintptr_t ram_end = 0x02000000UL + 16384UL;
-    const size_t data_sz = (size_t)(__data_end - __data_start);
-    const size_t bss_sz = (size_t)(__bss_end - __bss_start);
-
-    const uintptr_t stack_hi = (uintptr_t)&__sp;
-    const uintptr_t stack_lo = stack_hi - APP_STACK_BYTES;
-    const long gap_bss_stack = (long)stack_lo - (long)(uintptr_t)__bss_end;
-    const long stack_reserve = (long)((uintptr_t)__bss_end + APP_STACK_BYTES <= stack_hi);
-
-    xprintf("[RAM] data=%u bss=%u free=%ld gap=%ld stack_ok=%ld / 16384\r\n", (unsigned)data_sz,
-            (unsigned)bss_sz, (long)(ram_end - (uintptr_t)__bss_end), gap_bss_stack, stack_reserve);
-    xprintf("[RAM] g_sk=%u adc=%u arena=%lu/%lu fft=%u\r\n", (unsigned)sizeof(g_sk),
-            (unsigned)sizeof(adc_buffer), (unsigned long)tflm_arena_used_bytes(),
-            (unsigned long)tflm_arena_size_bytes(), (unsigned)spectrogram_kiss_fft_mem_used(&g_sk));
-}
+static void clock_init(void);
+static void usart_init(void);
+static void timer_init(void);
+static void adc_init(void);
+static void dma_init(void);
+static void dma_ch_config(DMA_ChannelHandleTypeDef *ch);
+static uint32_t timer_hz(void);
+static HAL_StatusTypeDef dma_wait_block(void);
+static uint16_t block_peak(const uint16_t *s, unsigned n);
+static uint16_t quiet_cal(void);
+static void warm_noise(void);
+static HAL_StatusTypeDef record_shot(void);
+static void shot_stash_fft_blocks(unsigned n_blk);
+static const uint16_t *shot_pcm_block(unsigned block_index);
+static void log_model_input(const int8_t *tensor);
+static void process_shot(void);
 
 int main(void) {
-    SystemClock_Config();
-    USART_Init();
+    clock_init();
+    usart_init();
     HAL_Time_SCR1TIM_Init();
-
-    ADC_Init();
-    DMA_Init();
-    TMR_Init();
-    configure_adc_timer_dma(&hdma_ch_adc);
-
+    adc_init();
+    dma_init();
+    timer_init();
+    dma_ch_config(&hdma_ch);
     HAL_Timer32_Start(&htimer);
 
-    spectrogram_kiss_init(&g_sk);
-    if (!spectrogram_kiss_fft_ready(&g_sk)) {
-        xprintf("[BOOT] FAIL: spectrogram init\r\n");
-        while (1) {
+    spectrogram_kiss_init(&sk);
+    if (!spectrogram_kiss_fft_ready(&sk)) {
+        xprintf("[BOOT] spectrogram init failed\r\n");
+        for (;;) {
         }
     }
 
-    xprintf("[BOOT] feat=micro_speech-frontend\r\n");
-    xprintf("[BOOT] quiet %u blk for ADC + pad cal...\r\n", (unsigned)QUIET_CAL_BLOCKS);
-    spectrogram_kiss_set_cal(&g_sk, 2048U, 2048);
-    const uint16_t adc_mid = adc_capture_quiet_and_cal(&g_sk);
-    spectrogram_kiss_set_cal(&g_sk, adc_mid, 2048);
-    if (spectrogram_kiss_pad_ready(&g_sk)) {
-        int8_t pmin = 127;
-        int8_t pmax = -128;
-        for (unsigned i = 0; i < SK_BINS; i++) {
-            const int8_t v = g_sk.pad_column[i];
-            if (v < pmin) {
-                pmin = v;
-            }
-            if (v > pmax) {
-                pmax = v;
-            }
-        }
-        xprintf("[BOOT] pad_col=%d..%d\r\n", (int)pmin, (int)pmax);
-    }
-    xprintf("[BOOT] MAX9814 mid=%u gain=8x pad=%s\r\n", (unsigned)adc_mid,
-            spectrogram_kiss_pad_ready(&g_sk) ? "cal" : "default");
+    xprintf("[BOOT] quiet cal %u blocks...\r\n", (unsigned)QUIET_BLOCKS);
+    adc_mid = quiet_cal();
+    spectrogram_kiss_set_cal(&sk, adc_mid, MIC_GAIN_Q8);
+    spectrogram_kiss_set_default_pad(&sk);
+    spectrogram_kiss_reset_stream(&sk);
+    warm_noise();
+    spectrogram_kiss_reset_stream(&sk);
 
-    if (tflm_init() != 0) {
-        xprintf("[BOOT] FAIL: tflm_init err=%d\r\n", tflm_last_error());
-        while (1) {
-        }
-    }
-
-    size_t in_sz = 0;
-    int8_t *input_tensor = (int8_t *)tflm_input_buffer(&in_sz);
-    if (input_tensor == NULL || in_sz != (size_t)SK_FEATURE_COUNT) {
-        xprintf("[BOOT] FAIL: input sz=%lu\r\n", (unsigned long)in_sz);
-        while (1) {
-        }
-    }
-
-    boot_ram_report();
-    xprintf("micro_speech: blk=%u @ %u Hz (1st ML ~%us @ ~250ms/blk)\r\n", (unsigned)ADC_DMA_HALFWORDS,
-            (unsigned)ADC_SAMPLE_RATE_HZ, (unsigned)(SK_SLICES * 250U / 1000U));
-    xprintf("[BOOT] enter loop\r\n");
+    adc_ram_capture_reset();
+    const unsigned cap_blk =
+        (unsigned)((adc_ram_capture_pool_bytes() + ADC_RAM_CAPTURE_BLOCK_BYTES) /
+                   ADC_RAM_CAPTURE_BLOCK_BYTES);
+    xprintf("[BOOT] mid=%u gain=%u trigger pk>=%u\r\n", (unsigned)adc_mid, (unsigned)MIC_GAIN_Q8,
+            (unsigned)TRIGGER_PK);
+    xprintf("[BOOT] dma_blk=%u B capture=%u B (~%u blk w/ fft_mem) arena=%u B\r\n",
+            (unsigned)sizeof(dma_buf), (unsigned)adc_ram_capture_pool_bytes(), cap_blk,
+            (unsigned)tflm_arena_size_bytes());
+    xprintf("[BOOT] DMA %u Hz %u smp/blk ~40ms (~25 blk/s idle)\r\n", (unsigned)SAMPLE_RATE_HZ,
+            (unsigned)DMA_SAMPLES);
 
     uint32_t blocks = 0;
-    uint32_t ml_invocations = 0;
-    uint32_t last_infer_frame_seq = 0;
-    uint32_t last_log_us = HAL_Time_SCR1TIM_Micros();
+    uint32_t log_t0 = HAL_Time_SCR1TIM_Micros();
 
-    while (1) {
+    for (;;) {
         blocks++;
-
-        const uint32_t t0_us = HAL_Time_SCR1TIM_Micros();
-        if (adc_dma_capture_block() != HAL_OK) {
-            xprintf("[LOOP] DMA timeout blk=%lu\r\n", (unsigned long)blocks);
+        if (dma_wait_block() != HAL_OK) {
             continue;
         }
-        const uint32_t cap_us = HAL_Time_SCR1TIM_Micros() - t0_us;
 
-        const uint32_t proc0 = HAL_Time_SCR1TIM_Micros();
-        spectrogram_kiss_push_adc_block(&g_sk, adc_buffer, ADC_DMA_HALFWORDS, input_tensor);
-        const uint32_t proc_us = HAL_Time_SCR1TIM_Micros() - proc0;
-
-        // for (int i = 0; i < ADC_DMA_HALFWORDS; i ++) {
-        //     xprintf("%d: %d;\r\n", i, adc_buffer[i]);
-        // }
-        if ((blocks % LOOP_LOG_INTERVAL) == 0U) {
-            uint16_t adc_min = 0;
-            uint16_t adc_max = 0;
-            int8_t feat_min = 0;
-            int8_t feat_max = 0;
-            adc_buffer_minmax(&adc_min, &adc_max);
-            const uint16_t sc = spectrogram_kiss_slice_count(&g_sk);
-            if (sc > 0U) {
-                const int8_t *col = (const int8_t *)input_tensor + ((uint32_t)(sc - 1U) * SK_BINS);
-                feat_min = 127;
-                feat_max = -128;
-                for (uint16_t i = 0; i < SK_BINS; i++) {
-                    const int8_t v = col[i];
-                    if (v < feat_min) {
-                        feat_min = v;
-                    }
-                    if (v > feat_max) {
-                        feat_max = v;
-                    }
-                }
-            }
-            const uint32_t now_us = HAL_Time_SCR1TIM_Micros();
-            const uint32_t span_us = now_us - last_log_us;
-            last_log_us = now_us;
-            const uint32_t blk_per_s_x10 =
-                (span_us > 0U) ? (LOOP_LOG_INTERVAL * 10000000UL / span_us) : 0U;
-            const uint32_t wall_hz = (blk_per_s_x10 * ADC_DMA_HALFWORDS) / 10U;
-            const uint32_t dma_hz =
-                (cap_us > 0U) ? ((uint32_t)ADC_DMA_HALFWORDS * 1000000UL / cap_us) : 0U;
-
-            xprintf("[LOOP] blk=%lu cap=%lu proc=%lu exp_cap=%lu slices=%u\r\n", (unsigned long)blocks,
-                    (unsigned long)cap_us, (unsigned long)proc_us, (unsigned long)adc_dma_expected_cap_us(),
-                    (unsigned)spectrogram_kiss_slice_count(&g_sk));
-            xprintf("[LOOP] dma_hz=%lu wall_hz=%lu adc=%u..%u feat=%d..%d\r\n",
-                    (unsigned long)dma_hz, (unsigned long)wall_hz, (unsigned)adc_min, (unsigned)adc_max,
-                    (int)feat_min, (int)feat_max);
+        const uint16_t pk = block_peak(dma_buf, DMA_SAMPLES);
+        if (pk > pk_win_max) {
+            pk_win_max = pk;
         }
 
-        const uint32_t fseq = spectrogram_kiss_frame_seq(&g_sk);
-        const uint16_t sc = spectrogram_kiss_slice_count(&g_sk);
-        /* One new spectrogram slice per 320 samples (20 ms @ 16 kHz); skip duplicate fseq. */
-        if (spectrogram_kiss_ready(&g_sk) && fseq > last_infer_frame_seq) {
-            last_infer_frame_seq = fseq;
-            ml_invocations++;
-            xprintf("[ML] invoke #%lu fseq=%lu slices=%u, time=%lu\r\n", (unsigned long)ml_invocations,
-                    (unsigned long)fseq, (unsigned)sc, (unsigned long)HAL_Time_SCR1TIM_Micros());
-
-            /* input_tensor already holds 49×40 when sc==SK_SLICES (no partial padding). */
-            if (ml_invocations <= 5U) {
-                int8_t col_min = 127;
-                int8_t col_max = -128;
-                const int8_t *live = (const int8_t *)input_tensor +
-                                     ((sc > 0U) ? ((uint32_t)(sc - 1U) * SK_BINS) : 0U);
-                for (uint16_t i = 0; i < SK_BINS; i++) {
-                    const int8_t v = live[i];
-                    if (v < col_min) {
-                        col_min = v;
-                    }
-                    if (v > col_max) {
-                        col_max = v;
-                    }
-                }
-                xprintf("[ML] live_col=%d..%d pad0=%d\r\n", (int)col_min, (int)col_max,
-                        (int)g_sk.pad_column[0]);
-            }
-
-            const uint32_t inv0 = HAL_Time_SCR1TIM_Micros();
-            if (tflm_invoke() != 0) {
-                xprintf("[ML] invoke failed err=%d\r\n", tflm_last_error());
+        if (pk >= TRIGGER_PK) {
+            static uint32_t cooldown;
+            if (cooldown > 0U) {
+                cooldown--;
                 continue;
             }
-            const uint32_t inv_us = HAL_Time_SCR1TIM_Micros() - inv0;
-            ml_log_result(ml_invocations);
-            if (ml_invocations <= 10U) {
-                xprintf("[ML] inv_us=%lu proc_us=%lu\r\n", (unsigned long)inv_us, (unsigned long)proc_us);
+            xprintf("[SHOT] pk=%u record\r\n", (unsigned)pk);
+            if (record_shot() == HAL_OK) {
+                process_shot();
+                log_t0 = HAL_Time_SCR1TIM_Micros();
+                cooldown = 80U;
+            } else {
+                xprintf("[SHOT] record failed\r\n");
             }
+            continue;
+        }
+
+        if ((blocks % LOOP_LOG_EVERY) == 0U) {
+            uint16_t lo = 0xFFFFU;
+            uint16_t hi = 0U;
+            for (unsigned i = 0U; i < DMA_SAMPLES; i++) {
+                if (dma_buf[i] < lo) {
+                    lo = dma_buf[i];
+                }
+                if (dma_buf[i] > hi) {
+                    hi = dma_buf[i];
+                }
+            }
+            const uint32_t dt = HAL_Time_SCR1TIM_Micros() - log_t0;
+            log_t0 = HAL_Time_SCR1TIM_Micros();
+            const uint32_t blk_per_s = (dt > 0U) ? (LOOP_LOG_EVERY * 1000000UL / dt) : 0U;
+            xprintf("[LOOP] blk=%lu ~%lu blk/s adc=%u..%u pk=%u\r\n", (unsigned long)blocks,
+                    (unsigned long)blk_per_s, (unsigned)lo, (unsigned)hi, (unsigned)pk_win_max);
+            pk_win_max = 0U;
         }
     }
 }
 
-static uint16_t adc_capture_quiet_and_cal(SpectrogramKissState *sk) {
-    uint32_t sum = 0U;
-    unsigned n = 0U;
+static HAL_StatusTypeDef record_shot(void) {
+    tflm_reset();
+    spectrogram_kiss_release_fft(&sk);
+    adc_ram_capture_reset();
+    adc_ram_capture_bind_fft(&sk);
+    const unsigned max_blk = adc_ram_capture_max_blocks();
 
-    spectrogram_kiss_begin_pad_cal(sk);
-    for (unsigned b = 0; b < QUIET_CAL_BLOCKS; b++) {
-        if (adc_dma_capture_block() != HAL_OK) {
-            break;
-        }
-        for (unsigned i = 0; i < ADC_DMA_HALFWORDS; i++) {
-            sum += adc_buffer[i];
-            n++;
-        }
-        spectrogram_kiss_push_adc_block(sk, adc_buffer, ADC_DMA_HALFWORDS, NULL);
+    if (adc_ram_capture_append_block(dma_buf) != HAL_OK) {
+        return HAL_ERROR;
     }
-    (void)spectrogram_kiss_finish_pad_cal(sk);
-
-    if (n == 0U) {
-        return 2048U;
+    for (unsigned b = 1U; b < max_blk; b++) {
+        if (dma_wait_block() != HAL_OK) {
+            return HAL_TIMEOUT;
+        }
+        if (adc_ram_capture_append_block(dma_buf) != HAL_OK) {
+            return HAL_ERROR;
+        }
     }
-    return (uint16_t)(sum / n);
+    xprintf("[SHOT] stored %u blk\r\n", (unsigned)adc_ram_capture_block_count());
+    return HAL_OK;
 }
 
-static void adc_buffer_minmax(uint16_t *out_min, uint16_t *out_max) {
-    uint16_t lo = 0xFFFFU;
-    uint16_t hi = 0U;
-    for (unsigned i = 0; i < ADC_DMA_HALFWORDS; i++) {
-        const uint16_t v = adc_buffer[i];
-        if (v < lo) {
-            lo = v;
+static void shot_stash_fft_blocks(unsigned n_blk) {
+    shot_fft_stashed = false;
+    for (unsigned b = 0U; b < n_blk; b++) {
+        if (!adc_ram_capture_block_in_fft_mem(&sk, b)) {
+            continue;
         }
-        if (v > hi) {
-            hi = v;
+        const uint16_t *pcm = adc_ram_capture_block_samples(b);
+        if (pcm == NULL) {
+            continue;
         }
-    }
-    if (out_min != NULL) {
-        *out_min = lo;
-    }
-    if (out_max != NULL) {
-        *out_max = hi;
+        memcpy(dma_buf, pcm, DMA_SAMPLES * sizeof(uint16_t));
+        shot_fft_stash_blk = (uint8_t)b;
+        shot_fft_stashed = true;
     }
 }
 
-static void ml_log_result(int inv) {
-    const int cls = tflm_get_result();
-    xprintf("[ML] #%d -> %s\r\n", inv, kwd_label(cls));
-    if ((uint32_t)inv <= ML_LOG_SCORES_MAX) {
+static const uint16_t *shot_pcm_block(unsigned block_index) {
+    if (shot_fft_stashed && (unsigned)shot_fft_stash_blk == block_index) {
+        return dma_buf;
+    }
+    return adc_ram_capture_block_samples(block_index);
+}
+
+static void process_shot(void) {
+    const unsigned n_blk = adc_ram_capture_block_count();
+    if (n_blk == 0U) {
+        return;
+    }
+
+    shot_stash_fft_blocks(n_blk);
+    if (!spectrogram_kiss_ensure_fft(&sk)) {
+        xprintf("[SHOT] fft init failed\r\n");
+        return;
+    }
+
+    spectrogram_kiss_reset_stream(&sk);
+    uint16_t pk_max = 0U;
+    const uint32_t t_fft0 = HAL_Time_SCR1TIM_Micros();
+
+    for (unsigned b = 0U; b < n_blk; b++) {
+        const uint16_t *pcm = shot_pcm_block(b);
+        if (pcm == NULL) {
+            xprintf("[SHOT] bad block %u\r\n", (unsigned)b);
+            return;
+        }
+        memcpy(dma_buf, pcm, DMA_SAMPLES * sizeof(uint16_t));
+        const uint16_t pk = block_peak(dma_buf, DMA_SAMPLES);
+        if (pk > pk_max) {
+            pk_max = pk;
+        }
+        spectrogram_kiss_push_adc_block(&sk, dma_buf, DMA_SAMPLES, feat_live);
+    }
+
+    const uint16_t hops = spectrogram_kiss_slice_count(&sk);
+    const uint32_t fft_ms = (HAL_Time_SCR1TIM_Micros() - t_fft0) / 1000U;
+    if (hops == 0U) {
+        xprintf("[SHOT] no features\r\n");
+        return;
+    }
+
+    const uint32_t t_init0 = HAL_Time_SCR1TIM_Micros();
+    if (tflm_init() != 0) {
+        xprintf("[SHOT] tflm_init err=%d\r\n", tflm_last_error());
+        tflm_reset();
+        return;
+    }
+
+    size_t in_sz = 0U;
+    int8_t *in = (int8_t *)tflm_input_buffer(&in_sz);
+    if (in == NULL || in_sz != (size_t)SK_FEATURE_COUNT) {
+        xprintf("[SHOT] bad input %lu\r\n", (unsigned long)in_sz);
+        tflm_reset();
+        return;
+    }
+
+    spectrogram_kiss_pack_for_inference(&sk, feat_live, hops, in);
+    const uint32_t init_ms = (HAL_Time_SCR1TIM_Micros() - t_init0) / 1000U;
+    log_model_input(in);
+
+    const uint32_t t_inv0 = HAL_Time_SCR1TIM_Micros();
+    const int err = tflm_invoke();
+    const uint32_t inv_ms = (HAL_Time_SCR1TIM_Micros() - t_inv0) / 1000U;
+
+    if (err != 0) {
+        xprintf("[SHOT] invoke err=%d\r\n", tflm_last_error());
+    } else {
+        const int cls = tflm_get_result();
+        const unsigned speech0 =
+            (SK_SPEECH_END_COL + 1U >= hops) ? (unsigned)(SK_SPEECH_END_COL + 1U - hops) : 0U;
+        xprintf("[SHOT] hops=%u pk=%u col%u..%u cls=%s fft=%lums init=%lums inv=%lums\r\n",
+                (unsigned)hops, (unsigned)pk_max, speech0, (unsigned)SK_SPEECH_END_COL, cls_name(cls),
+                (unsigned long)fft_ms, (unsigned long)init_ms, (unsigned long)inv_ms);
         tflm_log_output_scores();
     }
+    tflm_reset();
 }
 
-static uint32_t adc_dma_expected_cap_us(void) {
-    return (ADC_DMA_HALFWORDS * 1000000UL) / ADC_SAMPLE_RATE_HZ;
+static void log_model_input(const int8_t *tensor) {
+    if (tensor == NULL) {
+        return;
+    }
+    xprintf("[TENSOR] shape %u %u\r\n", (unsigned)SK_SLICES, (unsigned)SK_BINS);
+    xprintf("[TENSOR] begin\r\n");
+    for (unsigned col = 0U; col < SK_SLICES; col++) {
+        xprintf("[TENSOR] col%02u:", col);
+        for (unsigned bin = 0U; bin < SK_BINS; bin++) {
+            xprintf(" %d", (int)tensor[(size_t)col * SK_BINS + bin]);
+        }
+        xprintf("\r\n");
+    }
+    xprintf("[TENSOR] end\r\n");
 }
 
-static HAL_StatusTypeDef adc_dma_capture_block(void) {
-    const uint32_t dma_len_bytes = (uint32_t)(ADC_DMA_HALFWORDS * sizeof(uint16_t)) - 1U;
+static void warm_noise(void) {
+    for (unsigned b = 0U; b < 8U; b++) {
+        for (unsigned i = 0U; i < DMA_SAMPLES; i++) {
+            dma_buf[i] = adc_mid;
+        }
+        spectrogram_kiss_push_adc_block(&sk, dma_buf, DMA_SAMPLES, NULL);
+    }
+}
 
-    g_adc_dma_done = 0U;
-    ADC_DMA_PACE_TIMER->INT_CLEAR = 0xFFFFFFFFu;
-    HAL_DMA_Start(&hdma_ch_adc, (void *)&ANALOG_REG->ADC_VALUE, adc_buffer, dma_len_bytes);
-
-    uint32_t saw_busy = 0U;
-    const uint32_t deadline_us = HAL_Time_SCR1TIM_Micros() + adc_dma_block_timeout_us();
-    while (g_adc_dma_done == 0U) {
-        const int ready = HAL_DMA_GetChannelReadyStatus(&hdma_ch_adc);
-        if (ready == 0) {
-            saw_busy = 1U;
-        } else if (saw_busy != 0U) {
-            g_adc_dma_done = 1U;
+static uint16_t quiet_cal(void) {
+    uint32_t sum = 0U;
+    unsigned n = 0U;
+    for (unsigned b = 0U; b < QUIET_BLOCKS; b++) {
+        if (dma_wait_block() != HAL_OK) {
             break;
         }
+        for (unsigned i = 0U; i < DMA_SAMPLES; i++) {
+            sum += dma_buf[i];
+            n++;
+        }
+    }
+    return (n > 0U) ? (uint16_t)(sum / n) : 2048U;
+}
 
-        if (HAL_Time_SCR1TIM_Micros() >= deadline_us) {
-            xprintf("[DMA] timeout\r\n");
+static uint16_t block_peak(const uint16_t *s, unsigned n) {
+    uint16_t lo = 0xFFFFU;
+    uint16_t hi = 0U;
+    for (unsigned i = 0U; i < n; i++) {
+        if (s[i] < lo) {
+            lo = s[i];
+        }
+        if (s[i] > hi) {
+            hi = s[i];
+        }
+    }
+    const uint16_t d_hi = (hi >= adc_mid) ? (hi - adc_mid) : (adc_mid - hi);
+    const uint16_t d_lo = (lo >= adc_mid) ? (lo - adc_mid) : (adc_mid - lo);
+    return (d_hi > d_lo) ? d_hi : d_lo;
+}
+
+static HAL_StatusTypeDef dma_wait_block(void) {
+    const uint32_t len = (uint32_t)(DMA_SAMPLES * sizeof(uint16_t)) - 1U;
+    dma_done = 0U;
+    DMA_TIMER->INT_CLEAR = 0xFFFFFFFFu;
+    HAL_DMA_Start(&hdma_ch, (void *)&ANALOG_REG->ADC_VALUE, dma_buf, len);
+
+    uint32_t saw_busy = 0U;
+    const uint32_t deadline = HAL_Time_SCR1TIM_Micros() +
+                              ((DMA_SAMPLES * 1000000UL) / SAMPLE_RATE_HZ) * 3U;
+    while (dma_done == 0U) {
+        if (HAL_DMA_GetChannelReadyStatus(&hdma_ch) == 0) {
+            saw_busy = 1U;
+        } else if (saw_busy != 0U) {
+            dma_done = 1U;
+            break;
+        }
+        if (HAL_Time_SCR1TIM_Micros() >= deadline) {
             return HAL_TIMEOUT;
         }
     }
     return HAL_OK;
 }
 
-static uint32_t adc_pace_timer_hz(void) {
+static uint32_t timer_hz(void) {
     return HAL_PCC_GetSysClockFreq() / ((PM->DIV_AHB + 1U) * (PM->DIV_APB_P + 1U));
 }
 
-static uint32_t adc_dma_block_timeout_us(void) {
-    return ((ADC_DMA_HALFWORDS * 1000000UL) / ADC_SAMPLE_RATE_HZ) * 3U;
-}
-
-static void TMR_Init(void) {
-    const uint32_t pace_hz = adc_pace_timer_hz();
-    const uint32_t top = (pace_hz / ADC_SAMPLE_RATE_HZ) - 1U;
-
-    htimer.Instance = ADC_DMA_PACE_TIMER;
-    htimer.Top = top;
+static void timer_init(void) {
+    const uint32_t hz = timer_hz();
+    htimer.Instance = DMA_TIMER;
+    htimer.Top = (hz / SAMPLE_RATE_HZ) - 1U;
     htimer.Clock.Prescaler = 0;
     htimer.Clock.Source = TIMER32_SOURCE_TIM1_HCLK;
     htimer.CountMode = TIMER32_COUNTMODE_FORWARD;
     htimer.State = TIMER32_STATE_ENABLE;
     htimer.InterruptMask = 0;
-
     HAL_Timer32_Init(&htimer);
-    ADC_DMA_PACE_TIMER->INT_CLEAR = 0xFFFFFFFF;
-    xprintf("[TMR] HCLK %lu Hz TOP=%lu\r\n", (unsigned long)pace_hz, (unsigned long)ADC_DMA_PACE_TIMER->TOP);
+    DMA_TIMER->INT_CLEAR = 0xFFFFFFFFu;
 }
 
-static void ADC_Init(void) {
+static void adc_init(void) {
     hadc.Instance = ANALOG_REG;
     hadc.Init.Sel = ADC_CHANNEL0;
     hadc.Init.EXTRef = ADC_EXTREF_OFF;
@@ -361,7 +378,7 @@ static void ADC_Init(void) {
     HAL_ADC_ContinuousEnable(&hadc);
 }
 
-static void configure_adc_timer_dma(DMA_ChannelHandleTypeDef *ch) {
+static void dma_ch_config(DMA_ChannelHandleTypeDef *ch) {
     ch->dma = &hdma;
     ch->ChannelInit.Channel = DMA_CHANNEL_0;
     ch->ChannelInit.Priority = DMA_CHANNEL_PRIORITY_HIGH;
@@ -369,7 +386,7 @@ static void configure_adc_timer_dma(DMA_ChannelHandleTypeDef *ch) {
     ch->ChannelInit.ReadInc = DMA_CHANNEL_INC_DISABLE;
     ch->ChannelInit.ReadSize = DMA_CHANNEL_SIZE_HALFWORD;
     ch->ChannelInit.ReadBurstSize = 1U;
-    ch->ChannelInit.ReadRequest = ADC_DMA_PACE_REQUEST;
+    ch->ChannelInit.ReadRequest = DMA_REQ;
     ch->ChannelInit.ReadAck = DMA_CHANNEL_ACK_ENABLE;
     ch->ChannelInit.WriteMode = DMA_CHANNEL_MODE_MEMORY;
     ch->ChannelInit.WriteInc = DMA_CHANNEL_INC_ENABLE;
@@ -379,30 +396,33 @@ static void configure_adc_timer_dma(DMA_ChannelHandleTypeDef *ch) {
     ch->ChannelInit.WriteAck = DMA_CHANNEL_ACK_DISABLE;
 }
 
-static void DMA_Init(void) {
+static void dma_init(void) {
     hdma.Instance = DMA_CONFIG;
     hdma.CurrentValue = DMA_CURRENT_VALUE_ENABLE;
     HAL_DMA_Init(&hdma);
 }
 
 void SystemClock_Config(void) {
-    PCC_InitTypeDef PCC_OscInit = {0};
-
-    PCC_OscInit.OscillatorEnable = PCC_OSCILLATORTYPE_ALL;
-    PCC_OscInit.FreqMon.OscillatorSystem = PCC_OSCILLATORTYPE_OSC32M;
-    PCC_OscInit.FreqMon.ForceOscSys = PCC_FORCE_OSC_SYS_UNFIXED;
-    PCC_OscInit.FreqMon.Force32KClk = PCC_FREQ_MONITOR_SOURCE_OSC32K;
-    PCC_OscInit.AHBDivider = 0;
-    PCC_OscInit.APBMDivider = 0;
-    PCC_OscInit.APBPDivider = 0;
-    PCC_OscInit.HSI32MCalibrationValue = 128;
-    PCC_OscInit.LSI32KCalibrationValue = 8;
-    PCC_OscInit.RTCClockSelection = PCC_RTC_CLOCK_SOURCE_AUTO;
-    PCC_OscInit.RTCClockCPUSelection = PCC_CPU_RTC_CLOCK_SOURCE_OSC32K;
-    HAL_PCC_Config(&PCC_OscInit);
+    PCC_InitTypeDef pcc = {0};
+    pcc.OscillatorEnable = PCC_OSCILLATORTYPE_ALL;
+    pcc.FreqMon.OscillatorSystem = PCC_OSCILLATORTYPE_OSC32M;
+    pcc.FreqMon.ForceOscSys = PCC_FORCE_OSC_SYS_UNFIXED;
+    pcc.FreqMon.Force32KClk = PCC_FREQ_MONITOR_SOURCE_OSC32K;
+    pcc.AHBDivider = 0;
+    pcc.APBMDivider = 0;
+    pcc.APBPDivider = 0;
+    pcc.HSI32MCalibrationValue = 128;
+    pcc.LSI32KCalibrationValue = 8;
+    pcc.RTCClockSelection = PCC_RTC_CLOCK_SOURCE_AUTO;
+    pcc.RTCClockCPUSelection = PCC_CPU_RTC_CLOCK_SOURCE_OSC32K;
+    HAL_PCC_Config(&pcc);
 }
 
-static void USART_Init(void) {
+static void clock_init(void) {
+    SystemClock_Config();
+}
+
+static void usart_init(void) {
     husart0.Instance = UART_0;
     husart0.transmitting = Enable;
     husart0.receiving = Enable;

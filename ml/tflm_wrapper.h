@@ -29,6 +29,23 @@ void tflm_log_output_scores(void);
 
 size_t tflm_input_bytes(void);
 
+/** Scratch RAM (tensor arena) for use before tflm_init(); do not use after init. */
+void *tflm_arena_scratch(size_t *out_bytes);
+
+/** RAM only used before first tflm_init() (arena + interpreter + op resolver). */
+#define TFLM_PREINIT_SCRATCH_REGIONS 3U
+/** Returns 0 on success. */
+int tflm_preinit_scratch_region(unsigned index, void **out_ptr, size_t *out_bytes);
+
+/** Total bytes available for DMA capture before tflm_init() (shot pool slab). */
+size_t tflm_preinit_pool_bytes(void);
+
+/** Same as tflm_preinit_pool_bytes(); PCM may use the full slab including future arena tail. */
+size_t tflm_shot_pool_pcm_bytes(void);
+
+/** Release interpreter so RECORD can reuse pre-init scratch again. */
+void tflm_reset(void);
+
 #ifdef __cplusplus
 }
 #endif
