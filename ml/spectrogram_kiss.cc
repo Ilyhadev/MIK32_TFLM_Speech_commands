@@ -85,6 +85,8 @@ static int16_t adc12_to_pcm16(const SpectrogramKissState *st, uint16_t adc12) {
     return saturate_i32_to_i16(scaled);
 }
 
+static void limit_column_peak(int8_t *col);
+
 static void compute_slice(SpectrogramKissState *st, int8_t *out40) {
     kiss_fftr_cfg cfg = static_cast<kiss_fftr_cfg>(st->fftr_cfg);
     if (cfg == nullptr || out40 == nullptr) {
@@ -155,6 +157,7 @@ static void compute_slice(SpectrogramKissState *st, int8_t *out40) {
     for (uint16_t b = 0; b < SK_BINS; b++) {
         out40[b] = feature_to_int8(log_out[b]);
     }
+    limit_column_peak(out40);
 }
 
 static const int8_t *pad_column_ptr(const SpectrogramKissState *st) {
@@ -189,6 +192,12 @@ static void emit_hop_slice(SpectrogramKissState *st, int8_t *feature_window) {
     }
 
     compute_slice(st, slice_out);
+
+    /* Noise-only warmup: advance PCAN/noise_estimate, do not consume feat_live slots. */
+    if (feature_window == nullptr && !st->pad_cal_active) {
+        st->frame_seq++;
+        return;
+    }
 
     if (st->slice_count < SK_SLICES) {
         st->slice_count++;
@@ -260,6 +269,27 @@ static int8_t clamp_i8(int v) {
         return 127;
     }
     return static_cast<int8_t>(v);
+}
+
+static void limit_column_peak(int8_t *col) {
+    if (col == nullptr) {
+        return;
+    }
+    int8_t peak = -128;
+    for (unsigned b = 0U; b < SK_BINS; b++) {
+        if (col[b] > peak) {
+            peak = col[b];
+        }
+    }
+    if (peak <= static_cast<int8_t>(SK_COLUMN_PEAK_MAX)) {
+        return;
+    }
+    for (unsigned b = 0U; b < SK_BINS; b++) {
+        const int32_t scaled =
+            (static_cast<int32_t>(col[b]) * static_cast<int32_t>(SK_COLUMN_PEAK_MAX)) /
+            static_cast<int32_t>(peak);
+        col[b] = clamp_i8(static_cast<int>(scaled));
+    }
 }
 
 static void blend_column_ramp(int8_t *col, const int8_t *pad, const int8_t *speech, unsigned num,

@@ -19,9 +19,11 @@ extern "C" {
 /** Model trained on 49×20 ms ≈ 1 s; infer only when the sliding window is full. */
 #define SK_MIN_SLICES_INFER SK_SLICES
 /** Columns crossfaded pad<->speech after pack (0 = off). */
-#define SK_EDGE_BLEND_COLS 10U
+#define SK_EDGE_BLEND_COLS 0U
 /** Last speech column when packing short windows (cols after this are pad). */
 #define SK_SPEECH_END_COL 42U
+/** Per-column peak cap after FFT (stops mel columns pinning at 127). */
+#define SK_COLUMN_PEAK_MAX 110
 
 /** kiss_fftr_alloc(512) uses ~2836 B on MIK32; keep tight for 16 KiB RAM / stack headroom. */
 #define SK_FFT_MEM_MAX 2880U

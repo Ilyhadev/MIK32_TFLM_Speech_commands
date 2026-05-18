@@ -45,6 +45,9 @@ static uint16_t pk_win_max;
 
 static const char *cls_name(int c) {
     static const char *const n[] = {"silence", "unknown", "yes", "no"};
+    if (c == -1) {
+        return "ambiguous";
+    }
     return (c >= 0 && c <= 3) ? n[c] : "?";
 }
 
@@ -58,7 +61,8 @@ static uint32_t timer_hz(void);
 static HAL_StatusTypeDef dma_wait_block(void);
 static uint16_t block_peak(const uint16_t *s, unsigned n);
 static uint16_t quiet_cal(void);
-static void warm_noise(void);
+static void warm_noise_quiet(void);
+static unsigned tensor_saturated_bins(const int8_t *tensor);
 static HAL_StatusTypeDef record_shot(void);
 static void shot_stash_fft_blocks(unsigned n_blk);
 static const uint16_t *shot_pcm_block(unsigned block_index);
@@ -85,9 +89,13 @@ int main(void) {
     xprintf("[BOOT] quiet cal %u blocks...\r\n", (unsigned)QUIET_BLOCKS);
     adc_mid = quiet_cal();
     spectrogram_kiss_set_cal(&sk, adc_mid, MIC_GAIN_Q8);
-    spectrogram_kiss_set_default_pad(&sk);
-    spectrogram_kiss_reset_stream(&sk);
-    warm_noise();
+    spectrogram_kiss_begin_pad_cal(&sk);
+    warm_noise_quiet();
+    if (!spectrogram_kiss_finish_pad_cal(&sk)) {
+        spectrogram_kiss_set_default_pad(&sk);
+        xprintf("[BOOT] pad cal fallback default\r\n");
+    }
+    warm_noise_quiet();
     spectrogram_kiss_reset_stream(&sk);
 
     adc_ram_capture_reset();
@@ -226,7 +234,11 @@ static void process_shot(void) {
         if (pk > pk_max) {
             pk_max = pk;
         }
-        spectrogram_kiss_push_adc_block(&sk, dma_buf, DMA_SAMPLES, feat_live);
+        if (b == 0U && n_blk > 1U) {
+            spectrogram_kiss_push_adc_block(&sk, dma_buf, DMA_SAMPLES, NULL);
+        } else {
+            spectrogram_kiss_push_adc_block(&sk, dma_buf, DMA_SAMPLES, feat_live);
+        }
     }
 
     const uint16_t hops = spectrogram_kiss_slice_count(&sk);
@@ -252,6 +264,7 @@ static void process_shot(void) {
     }
 
     spectrogram_kiss_pack_for_inference(&sk, feat_live, hops, in);
+    const unsigned sat_bins = tensor_saturated_bins(in);
     const uint32_t init_ms = (HAL_Time_SCR1TIM_Micros() - t_init0) / 1000U;
     log_model_input(in);
 
@@ -265,9 +278,9 @@ static void process_shot(void) {
         const int cls = tflm_get_result();
         const unsigned speech0 =
             (SK_SPEECH_END_COL + 1U >= hops) ? (unsigned)(SK_SPEECH_END_COL + 1U - hops) : 0U;
-        xprintf("[SHOT] hops=%u pk=%u col%u..%u cls=%s fft=%lums init=%lums inv=%lums\r\n",
-                (unsigned)hops, (unsigned)pk_max, speech0, (unsigned)SK_SPEECH_END_COL, cls_name(cls),
-                (unsigned long)fft_ms, (unsigned long)init_ms, (unsigned long)inv_ms);
+        xprintf("[SHOT] hops=%u pk=%u sat=%u col%u..%u cls=%s fft=%lums init=%lums inv=%lums\r\n",
+                (unsigned)hops, (unsigned)pk_max, sat_bins, speech0, (unsigned)SK_SPEECH_END_COL,
+                cls_name(cls), (unsigned long)fft_ms, (unsigned long)init_ms, (unsigned long)inv_ms);
         tflm_log_output_scores();
     }
     tflm_reset();
@@ -289,10 +302,10 @@ static void log_model_input(const int8_t *tensor) {
     xprintf("[TENSOR] end\r\n");
 }
 
-static void warm_noise(void) {
+static void warm_noise_quiet(void) {
     for (unsigned b = 0U; b < 8U; b++) {
-        for (unsigned i = 0U; i < DMA_SAMPLES; i++) {
-            dma_buf[i] = adc_mid;
+        if (dma_wait_block() != HAL_OK) {
+            break;
         }
         spectrogram_kiss_push_adc_block(&sk, dma_buf, DMA_SAMPLES, NULL);
     }
@@ -311,6 +324,16 @@ static uint16_t quiet_cal(void) {
         }
     }
     return (n > 0U) ? (uint16_t)(sum / n) : 2048U;
+}
+
+static unsigned tensor_saturated_bins(const int8_t *tensor) {
+    unsigned sat = 0U;
+    for (unsigned i = 0U; i < SK_FEATURE_COUNT; i++) {
+        if (tensor[i] >= 127 || tensor[i] <= -128) {
+            sat++;
+        }
+    }
+    return sat;
 }
 
 static uint16_t block_peak(const uint16_t *s, unsigned n) {

@@ -23,6 +23,7 @@ void* tflm_input_buffer(size_t* input_size);
 /** Bytes per input element (1 for int8/uint8 feature maps). */
 size_t tflm_input_element_size(void);
 
+/** Class index 0..3, or -1 if top scores tie (ambiguous). */
 int tflm_get_result(void);
 void tflm_log_tensors(void);
 void tflm_log_output_scores(void);

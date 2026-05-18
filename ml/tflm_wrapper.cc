@@ -278,19 +278,18 @@ void tflm_log_output_scores(void) {
         xprintf(" %d", (int)scores[i]);
     }
     xprintf(" q8:");
-    int best = 0;
-    int best_q = scores[0];
     for (int i = 0; i < n; i++) {
         const int q =
             (int)((static_cast<float>(scores[i]) - static_cast<float>(output_zero_point)) *
                   output_scale * 1000.0f);
         xprintf(" %s%d", labels[i], q);
-        if (scores[i] > best_q) {
-            best_q = scores[i];
-            best = i;
-        }
     }
-    xprintf(" -> %s\r\n", labels[best]);
+    const int pick = tflm_get_result();
+    if (pick < 0) {
+        xprintf(" -> tie\r\n");
+    } else {
+        xprintf(" -> %s\r\n", labels[pick]);
+    }
 }
 
 int tflm_run(const int8_t* input, size_t input_size) {
@@ -341,17 +340,46 @@ int tflm_get_result(void) {
     if (!initialized || output_data == nullptr || output_bytes != kCategoryBytes) {
         return -1;
     }
-    const int8_t* scores = static_cast<const int8_t*>(output_data);
-    int8_t max_val = scores[0];
-    int max_idx = 0;
+    const int8_t *scores = static_cast<const int8_t *>(output_data);
     const int n = (output_bytes < 4) ? output_bytes : 4;
+    int8_t max_val = scores[0];
     for (int i = 1; i < n; i++) {
         if (scores[i] > max_val) {
             max_val = scores[i];
-            max_idx = i;
         }
     }
-    return max_idx;
+    int tied[4];
+    int ntied = 0;
+    for (int i = 0; i < n; i++) {
+        if (scores[i] == max_val) {
+            tied[ntied++] = i;
+        }
+    }
+    if (ntied == 1) {
+        return tied[0];
+    }
+    /* Quantized logits often collapse: decode ties without retraining. */
+    auto has = [&](int idx) {
+        for (int j = 0; j < ntied; j++) {
+            if (tied[j] == idx) {
+                return true;
+            }
+        }
+        return false;
+    };
+    if (has(2) && has(3)) {
+        return -1;
+    }
+    if (has(1) && has(3)) {
+        return 3;
+    }
+    if (has(1) && has(2)) {
+        return 1;
+    }
+    if (has(1) && has(2) && has(3)) {
+        return 1;
+    }
+    return tied[0];
 }
 
 size_t tflm_input_bytes(void) {
