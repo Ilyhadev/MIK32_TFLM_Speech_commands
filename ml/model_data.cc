@@ -1,4 +1,3 @@
-// ml/model_data.cc
 #include "model_data.h"
 
 // Linked from micro_speech/models/model.cc (const in flash).

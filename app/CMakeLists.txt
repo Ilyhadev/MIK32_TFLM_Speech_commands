@@ -2,7 +2,6 @@
 set(APP_NAME ${CMAKE_PROJECT_NAME})
 
 add_executable(${APP_NAME}
-    trap_entry.S
     main.c
     debug_io.cc
     mik32_tflm_log.c
@@ -20,10 +19,9 @@ target_link_directories(${APP_NAME} PRIVATE
     ${CMAKE_SOURCE_DIR}/hardware/mik32v2-shared/ldscripts
 )
 
-# Invoke + xprintf need depth; tensor_arena ends 128 B below stack — avoid overlap.
-target_link_options(${APP_NAME} PRIVATE
-    "LINKER:--defsym=__stack_size=1344"
-)
+# target_link_options(${APP_NAME} PRIVATE
+#     "LINKER:--defsym=__stack_size=1280"
+# )
 
 add_custom_command(TARGET ${APP_NAME}
     POST_BUILD

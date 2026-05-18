@@ -17,7 +17,7 @@ namespace {
     constexpr int kCategoryBytes = 4;
 
     /* ~6804 B used after AllocateTensors(); keep minimal margin in 16 KiB RAM. */
-    constexpr size_t kArenaSize = 6848;
+    constexpr size_t kArenaSize = 6812;
     alignas(16) static uint8_t tensor_arena[kArenaSize];
 
     alignas(tflite::MicroMutableOpResolver<4>) static uint8_t op_resolver_buf[sizeof(tflite::MicroMutableOpResolver<4>)];
@@ -40,6 +40,8 @@ namespace {
     static size_t output_element_size = 0;
     static size_t arena_used_cached = 0;
     static size_t arena_free_cached = 0;
+    static float output_scale = 0.0f;
+    static int output_zero_point = 0;
 }
 
 static size_t tensor_element_size_from_dims(const TfLiteTensor* t) {
@@ -102,9 +104,13 @@ static int cache_tensor_ptrs(void) {
 
     arena_used_cached = interpreter->arena_used_bytes();
     arena_free_cached = (arena_used_cached < kArenaSize) ? (kArenaSize - arena_used_cached) : 0U;
+    output_scale = out->params.scale;
+    output_zero_point = out->params.zero_point;
 
     xprintf("[TFLM] init arena %u/%u in=%d out=%d\r\n", (unsigned)arena_used_cached,
             (unsigned)kArenaSize, input_bytes, output_bytes);
+    xprintf("[TFLM] out zp=%d scale~%lu\r\n", output_zero_point,
+            (unsigned long)(output_scale * 1000000.0f));
     return 0;
 }
 
@@ -213,12 +219,26 @@ void tflm_log_output_scores(void) {
         return;
     }
     const int8_t* scores = static_cast<const int8_t*>(output_data);
-    xprintf("[TFLM] scores:");
-    const int n = (output_bytes < 8) ? output_bytes : 8;
+    static const char* const labels[] = {"sil", "unk", "yes", "no"};
+    xprintf("[TFLM] int8:");
+    const int n = (output_bytes < 4) ? output_bytes : 4;
     for (int i = 0; i < n; i++) {
         xprintf(" %d", (int)scores[i]);
     }
-    xprintf(" -> cls=%d\r\n", tflm_get_result());
+    xprintf(" q8:");
+    int best = 0;
+    int best_q = scores[0];
+    for (int i = 0; i < n; i++) {
+        const int q =
+            (int)((static_cast<float>(scores[i]) - static_cast<float>(output_zero_point)) *
+                  output_scale * 1000.0f);
+        xprintf(" %s%d", labels[i], q);
+        if (scores[i] > best_q) {
+            best_q = scores[i];
+            best = i;
+        }
+    }
+    xprintf(" -> %s\r\n", labels[best]);
 }
 
 int tflm_run(const int8_t* input, size_t input_size) {

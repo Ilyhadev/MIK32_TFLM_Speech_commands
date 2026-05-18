@@ -2,13 +2,20 @@ MIK32_HAL_DIR=hardware/mik32-hal
 MIK32_SHARED_DIR=hardware/mik32v2-shared
 
 BUILD_DIR=build
+TFLM_MICROLITE=third_party/tflite-micro/gen/mik32_x86_64_release_with_logs_gcc/lib/libtensorflow-microlite.a
 
 SERIAL_PORT?=/dev/ttyUSB0
 SERIAL_BOUDRATE?=115200
 
 .PHONY: clean flash monitor
 
-build_app: update_submodules $(BUILD_DIR)
+$(TFLM_MICROLITE):
+	. .venv/bin/activate && \
+	export PATH="/mik32_utils/xpack-riscv-none-elf-gcc-14.2.0-3/bin:$$PATH" && \
+	$(MAKE) -C third_party/tflite-micro -f tensorflow/lite/micro/tools/make/Makefile \
+		TARGET=mik32 BUILD_TYPE=release_with_logs microlite
+
+build_app: $(TFLM_MICROLITE) update_submodules $(BUILD_DIR)
 	cmake --build $(BUILD_DIR)
 
 update_submodules: $(MIK32_HAL_DIR)/README.md $(MIK32_SHARED_DIR)/README.md
