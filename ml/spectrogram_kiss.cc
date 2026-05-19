@@ -96,7 +96,7 @@ static void compute_slice(SpectrogramKissState *st, int8_t *out40) {
     auto *const line = reinterpret_cast<kiss_fft_cpx *>(st->fft_u.fft_line);
     kiss_fftr(cfg, st->fft_u.fft_time, line);
 
-    /* In-place complex → energy in fft_line; do NOT memset before read (was → all -128). */
+    /* In-place complex -> energy in fft_line; do NOT memset before read (was -> all -128). */
     auto *const cplx = reinterpret_cast<::Complex<int16_t> *>(st->fft_u.fft_line);
     auto *const spectrum = reinterpret_cast<uint32_t *>(st->fft_u.fft_line);
     SpectrumToEnergy(cplx, SK_ENERGY_START, SK_ENERGY_END, spectrum);
