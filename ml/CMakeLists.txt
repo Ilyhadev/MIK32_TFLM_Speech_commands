@@ -1,41 +1,46 @@
-# Must match the directory produced by:
-#   make -f tensorflow/lite/micro/tools/make/Makefile TARGET=mik32 BUILD_TYPE=... microlite
-# Use BUILD_TYPE=release_with_logs while debugging (-14 etc.); release strips all TFLM log strings.
-# Must match: gen/<subdir>/lib/libtensorflow-microlite.a after `make ... microlite`
-# Example: BUILD_TYPE=release_with_logs -> mik32_x86_64_release_with_logs_gcc
-set(TFLM_GEN_SUBDIR "mik32_x86_64_release_with_logs_gcc" CACHE STRING "tflite-micro gen/ subdir (see Makefile GENDIR)")
+# Rebuild microlite (from repo root, venv + RISC-V toolchain on PATH):
+#   source .venv/bin/activate
+#   export PATH=/mik32_utils/xpack-riscv-none-elf-gcc-14.2.0-3/bin:$PATH
+#   make -C third_party/tflite-micro -f tensorflow/lite/micro/tools/make/Makefile \
+#     TARGET=mik32 BUILD_TYPE=release_with_logs microlite
+set(TFLM_GEN_SUBDIR "mik32_x86_64_release_with_logs_gcc" CACHE STRING "tflite-micro gen/ subdir")
 set(TFLM_GEN_ROOT "${CMAKE_SOURCE_DIR}/third_party/tflite-micro/gen/${TFLM_GEN_SUBDIR}")
+set(TFLM_MICROLITE_LIB "${TFLM_GEN_ROOT}/lib/libtensorflow-microlite.a")
+set(TFLM_ROOT "${CMAKE_SOURCE_DIR}/third_party/tflite-micro")
 
 add_library(tflm_wrapper STATIC tflm_wrapper.cc)
+target_sources(tflm_wrapper PRIVATE ${CMAKE_SOURCE_DIR}/micro_speech/models/model.cc)
 target_include_directories(tflm_wrapper PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_SOURCE_DIR}/third_party/tflite-micro
-    ${CMAKE_SOURCE_DIR}/third_party/tflite-micro/tensorflow/lite/micro/tools/make/downloads/flatbuffers/include
-    ${CMAKE_SOURCE_DIR}/third_party/tflite-micro/tensorflow/lite/micro/tools/make/downloads/gemmlowp
-    ${CMAKE_SOURCE_DIR}/third_party/tflite-micro/tensorflow/lite/micro/tools/make/downloads/ruy
-    ${CMAKE_SOURCE_DIR}/third_party/tflite-micro/tensorflow/lite/micro/tools/make/downloads/kissfft
+    ${TFLM_ROOT}
+    ${TFLM_ROOT}/tensorflow/lite/micro/tools/make/downloads/flatbuffers/include
+    ${TFLM_ROOT}/tensorflow/lite/micro/tools/make/downloads/gemmlowp
+    ${TFLM_ROOT}/tensorflow/lite/micro/tools/make/downloads/ruy
 )
-target_link_libraries(tflm_wrapper PUBLIC
-    ${TFLM_GEN_ROOT}/lib/libtensorflow-microlite.a
-)
+target_link_libraries(tflm_wrapper PUBLIC ${TFLM_MICROLITE_LIB})
 
-# Optional: proves kiss_fft_fixed16::* resolve from microlite.a (see ENABLE_KISS_FFT_LINK_TEST).
-option(ENABLE_KISS_FFT_LINK_TEST
-    "Link kiss_fft_link_test (pulls kiss_fft from microlite; may overflow 16 KiB RAM)" OFF)
-if(ENABLE_KISS_FFT_LINK_TEST)
-    add_library(kiss_fft_link_test STATIC kiss_fft_link_test.cc)
-    target_include_directories(kiss_fft_link_test PRIVATE
-        ${CMAKE_SOURCE_DIR}/third_party/tflite-micro
-        ${CMAKE_SOURCE_DIR}/third_party/tflite-micro/tensorflow/lite/micro/tools/make/downloads/kissfft
-        ${CMAKE_SOURCE_DIR}/third_party/tflite-micro/tensorflow/lite/micro/tools/make/downloads/kissfft/tools
-    )
-endif()
-
-add_library(model_data STATIC model_data.cc)
-target_include_directories(model_data PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_sources(model_data PRIVATE
-    ${CMAKE_SOURCE_DIR}/micro_speech/models/model.cc
+set(SIGNAL_SRC
+    ${TFLM_ROOT}/signal/src/window.cc
+    ${TFLM_ROOT}/signal/src/fft_auto_scale.cc
+    ${TFLM_ROOT}/signal/src/max_abs.cc
+    ${TFLM_ROOT}/signal/src/msb_32.cc
+    ${TFLM_ROOT}/signal/src/energy.cc
+    ${TFLM_ROOT}/signal/src/filter_bank.cc
+    ${TFLM_ROOT}/signal/src/filter_bank_square_root.cc
+    ${TFLM_ROOT}/signal/src/filter_bank_spectral_subtraction.cc
+    ${TFLM_ROOT}/signal/src/filter_bank_log.cc
+    ${TFLM_ROOT}/signal/src/log.cc
+    ${TFLM_ROOT}/signal/src/square_root_64.cc
+    ${TFLM_ROOT}/signal/src/pcan_argc_fixed.cc
 )
 
-add_library(feature_extractor STATIC feature_extractor.c)
-target_include_directories(feature_extractor PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+add_library(spectrogram_kiss STATIC spectrogram_kiss.cc ${SIGNAL_SRC})
+target_include_directories(spectrogram_kiss PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(spectrogram_kiss PRIVATE
+    ${CMAKE_SOURCE_DIR}/hardware/mik32v2-shared/include
+    ${CMAKE_SOURCE_DIR}/hardware/mik32v2-shared/periphery
+    ${TFLM_ROOT}
+    ${TFLM_ROOT}/tensorflow/lite/micro/tools/make/downloads/kissfft
+    ${TFLM_ROOT}/tensorflow/lite/micro/tools/make/downloads/kissfft/tools
+)
+target_link_libraries(spectrogram_kiss PUBLIC ${TFLM_MICROLITE_LIB})

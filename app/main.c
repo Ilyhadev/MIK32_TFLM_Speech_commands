@@ -1,222 +1,360 @@
-
 void *__dso_handle __attribute__((weak));
 
-#include "epic.h"
-#include "mik32_hal_irq.h"
+#include "dma_config.h"
 #include "mik32_hal_adc.h"
 #include "mik32_hal_dma.h"
 #include "mik32_hal_usart.h"
 #include "mik32_hal_timer32.h"
-#include "scr1_timer.h"
+#include "mik32_hal_scr1_timer.h"
 #include "timer32.h"
 #include "xprintf.h"
+
+#include <stddef.h>
+#include <stdint.h>
+#include <string.h>
+
+#include "adc_ram_capture.h"
+#include "spectrogram_kiss.h"
 #include "tflm_wrapper.h"
-#include "kiss_fft_link_test.h"
-#include "circular_buffer.h"
 
-#define SYSTEM_FREQ_HZ 32000000UL
-
-#define ADC_RAW_VALUE_MAX                4095U
-#define LOOP_DELAY_MS                    800U
-#define SAMPLE_FREQ_HZ (100)
-#define BLINK_PERIOD_TICKS (SYSTEM_FREQ_HZ / SAMPLE_FREQ_HZ)
-#define ADC_BUFFER_SIZE 256
-
-static void SystemClock_Config();
-static void USART_Init();
+#define SAMPLE_RATE_HZ 16000U
+#define DMA_TIMER TIMER32_1
+#define DMA_REQ DMA_CHANNEL_TIMER32_1_REQUEST
+#define DMA_SAMPLES (SK_FRAME_HOP * 2U)
+#define HOPS_PER_DMA_BLOCK (DMA_SAMPLES / SK_FRAME_HOP)
+#define MAX_LIVE_HOPS 16U
+#define QUIET_BLOCKS 20U
+#define TRIGGER_PK 200U
+#define MIC_GAIN_Q8 32
 
 static USART_HandleTypeDef husart0;
-ADC_HandleTypeDef hadc;
-DMA_InitTypeDef hdma;
+static ADC_HandleTypeDef hadc;
+static DMA_InitTypeDef hdma;
+static TIMER32_HandleTypeDef htimer;
+static DMA_ChannelHandleTypeDef hdma_ch;
+static uint16_t dma_buf[DMA_SAMPLES];
+static SpectrogramKissState sk;
+static int8_t feat_live[MAX_LIVE_HOPS * SK_BINS];
+static uint8_t shot_fft_stash_blk;
+static bool shot_fft_stashed;
 
-TIMER32_HandleTypeDef htimer;
+static volatile uint32_t dma_done;
+static uint16_t adc_mid = 1630U;
+static const char *cls_name(int c) {
+    static const char *const n[] = {"silence", "unknown", "yes", "no"};
+    if (c == -1) {
+        return "ambiguous";
+    }
+    return (c >= 0 && c <= 3) ? n[c] : "?";
+}
 
-// Debug counters
-volatile uint32_t dma_interrupt_count = 0;
-volatile uint32_t dma_spurious_interrupts = 0;
+static void clock_init(void);
+static void usart_init(void);
+static void timer_init(void);
+static void adc_init(void);
+static void dma_init(void);
+static void dma_ch_config(DMA_ChannelHandleTypeDef *ch);
+static uint32_t timer_hz(void);
+static HAL_StatusTypeDef dma_wait_block(void);
+static uint16_t block_peak(const uint16_t *s, unsigned n);
+static uint16_t quiet_cal(void);
+static void warm_noise_quiet(void);
+static HAL_StatusTypeDef record_shot(void);
+static void shot_stash_fft_blocks(unsigned n_blk);
+static const uint16_t *shot_pcm_block(unsigned block_index);
+static void process_shot(void);
 
-void TMR_Init();
-static void ADC_Init(void);
-static void DMA_Init(void);
-static void configure_interrupts();
+int main(void) {
+    clock_init();
+    usart_init();
+    HAL_Time_SCR1TIM_Init();
+    adc_init();
+    dma_init();
+    timer_init();
+    dma_ch_config(&hdma_ch);
+    HAL_Timer32_Start(&htimer);
 
-void configure_mem_to_mem_dma(DMA_InitTypeDef* hdma, DMA_ChannelHandleTypeDef* ch);
-uint16_t adc_buffer[ADC_BUFFER_SIZE];
-DMA_ChannelHandleTypeDef hdma_ch_mem_to_mem;
+    spectrogram_kiss_init(&sk);
+    if (!spectrogram_kiss_fft_ready(&sk)) {
+        xprintf("[BOOT] spectrogram init failed\r\n");
+        for (;;) {
+        }
+    }
 
-int main() {
-    SystemClock_Config();
-    USART_Init();
-    xprintf("\r\n--- System Boot ---\r\n");
-    
-    ADC_Init();
-    DMA_Init();
-    TMR_Init();
-    __HAL_PCC_EPIC_CLK_ENABLE();
-    EPIC->MASK_LEVEL_SET = 1 << (EPIC_LINE_TIMER32_2_S);
-    HAL_IRQ_EnableInterrupts();
+    adc_mid = quiet_cal();
+    spectrogram_kiss_set_cal(&sk, adc_mid, MIC_GAIN_Q8);
+    warm_noise_quiet();
+    spectrogram_kiss_reset_stream(&sk);
+    adc_ram_capture_reset();
 
-    configure_mem_to_mem_dma(&hdma, &hdma_ch_mem_to_mem);
-    
-    xprintf("Starting Free-Running DMA Polling...\r\n");
+    xprintf("[BOOT] mid=%u gain=%u pk>=%u cap=%uB\r\n", (unsigned)adc_mid, (unsigned)MIC_GAIN_Q8,
+            (unsigned)TRIGGER_PK, (unsigned)adc_ram_capture_pool_bytes());
 
-
-    // MIK32 HAL requires length in BYTES minus 1.
-    uint32_t dma_len = (ADC_BUFFER_SIZE * sizeof(uint16_t)) - 1;
-    uint32_t buffer_count = 0;
-    
-    // Kick off the continuous ADC conversions
-    //HAL_ADC_ContinuousEnable(&hadc);
-    // HAL_ADC_SingleConversionStart(&hadc); // Force the first trigger just in case
-    // 1. Start the DMA transfer
-
-    while (1) {
-        xprintf("%d\n\r", TIMER32_0->VALUE);
-        HAL_DMA_Start(&hdma_ch_mem_to_mem, 
-                      (void*)&ANALOG_REG->ADC_VALUE, 
-                      adc_buffer, 
-                      200);
-        // 2. Wait for the channel to become READY (meaning transfer is done)
-        // HAL_DMA_Wait safely polls the READY bit in CONFIG_STATUS
-        if (HAL_DMA_Wait(&hdma_ch_mem_to_mem, 1000) == HAL_OK) {
-            
-            buffer_count++;
-            
-            // 3. Print the data
-            xprintf("Buffer #%lu full! First: %u, Last: %u\r\n", 
-                    buffer_count, adc_buffer[0], adc_buffer[ADC_BUFFER_SIZE - 1]);
-            
-            // Optional: small delay so you don't flood your terminal too fast
-            for(volatile int i=0; i<1000; i++); 
-            
-        } else {
-            xprintf("DMA Timeout! Transfer got stuck.\r\n");
+    for (;;) {
+        if (dma_wait_block() != HAL_OK) {
+            continue;
         }
 
+        const uint16_t pk = block_peak(dma_buf, DMA_SAMPLES);
+        if (pk >= TRIGGER_PK) {
+            static uint32_t cooldown;
+            if (cooldown > 0U) {
+                cooldown--;
+                continue;
+            }
+            if (record_shot() == HAL_OK) {
+                process_shot();
+            } else {
+                xprintf("[SHOT] record fail\r\n");
+            }
+            cooldown = 80U;
+        }
     }
 }
 
-void trap_handler() {
-    xprintf("dsa");
-    if (EPIC->RAW_STATUS & (1 << EPIC_LINE_TIMER32_0_S)) {
-        TIMER32_0->INT_CLEAR = TIMER32_INT_OVERFLOW_M;
-         EPIC->CLEAR = EPIC_LINE_TIMER32_0_S;
-        
+static HAL_StatusTypeDef record_shot(void) {
+    tflm_reset();
+    spectrogram_kiss_release_fft(&sk);
+    adc_ram_capture_reset();
+    adc_ram_capture_bind_fft(&sk);
+    const unsigned max_blk = adc_ram_capture_max_blocks();
+
+    if (adc_ram_capture_append_block(dma_buf) != HAL_OK) {
+        return HAL_ERROR;
+    }
+    for (unsigned b = 1U; b < max_blk; b++) {
+        if (dma_wait_block() != HAL_OK) {
+            return HAL_TIMEOUT;
+        }
+        if (adc_ram_capture_append_block(dma_buf) != HAL_OK) {
+            return HAL_ERROR;
+        }
+    }
+    return HAL_OK;
+}
+
+static void shot_stash_fft_blocks(unsigned n_blk) {
+    shot_fft_stashed = false;
+    for (unsigned b = 0U; b < n_blk; b++) {
+        if (!adc_ram_capture_block_in_fft_mem(&sk, b)) {
+            continue;
+        }
+        const uint16_t *pcm = adc_ram_capture_block_samples(b);
+        if (pcm == NULL) {
+            continue;
+        }
+        memcpy(dma_buf, pcm, DMA_SAMPLES * sizeof(uint16_t));
+        shot_fft_stash_blk = (uint8_t)b;
+        shot_fft_stashed = true;
     }
 }
 
-
-void SystemClock_Config(void)
-{
-    PCC_InitTypeDef PCC_OscInit = {0};
-
-    PCC_OscInit.OscillatorEnable = PCC_OSCILLATORTYPE_ALL;
-    PCC_OscInit.FreqMon.OscillatorSystem = PCC_OSCILLATORTYPE_OSC32M;
-    PCC_OscInit.FreqMon.ForceOscSys = PCC_FORCE_OSC_SYS_UNFIXED;
-    PCC_OscInit.FreqMon.Force32KClk = PCC_FREQ_MONITOR_SOURCE_OSC32K;
-    PCC_OscInit.AHBDivider = 0;
-    PCC_OscInit.APBMDivider = 0;
-    PCC_OscInit.APBPDivider = 0;
-    PCC_OscInit.HSI32MCalibrationValue = 128;
-    PCC_OscInit.LSI32KCalibrationValue = 8;
-    PCC_OscInit.RTCClockSelection = PCC_RTC_CLOCK_SOURCE_AUTO;
-    PCC_OscInit.RTCClockCPUSelection = PCC_CPU_RTC_CLOCK_SOURCE_OSC32K;
-    HAL_PCC_Config(&PCC_OscInit);
+static const uint16_t *shot_pcm_block(unsigned block_index) {
+    if (shot_fft_stashed && (unsigned)shot_fft_stash_blk == block_index) {
+        return dma_buf;
+    }
+    return adc_ram_capture_block_samples(block_index);
 }
 
-void TMR_Init() {
-    // Enable clock
-    PM->CLK_APB_M_SET = PM_CLOCK_APB_M_TIMER32_0_M;
-    
-    htimer.Instance = TIMER32_0;
-    htimer.Top = 2000;
+static void process_shot(void) {
+    const unsigned n_blk = adc_ram_capture_block_count();
+    if (n_blk == 0U) {
+        return;
+    }
+
+    shot_stash_fft_blocks(n_blk);
+    if (!spectrogram_kiss_ensure_fft(&sk)) {
+        xprintf("[SHOT] fft init failed\r\n");
+        return;
+    }
+
+    spectrogram_kiss_reset_stream(&sk);
+    uint16_t pk_max = 0U;
+
+    for (unsigned b = 0U; b < n_blk; b++) {
+        const uint16_t *pcm = shot_pcm_block(b);
+        if (pcm == NULL) {
+            xprintf("[SHOT] bad blk %u\r\n", (unsigned)b);
+            return;
+        }
+        memcpy(dma_buf, pcm, DMA_SAMPLES * sizeof(uint16_t));
+        const uint16_t pk = block_peak(dma_buf, DMA_SAMPLES);
+        if (pk > pk_max) {
+            pk_max = pk;
+        }
+        if (b == 0U && n_blk > 1U) {
+            spectrogram_kiss_push_adc_block(&sk, dma_buf, DMA_SAMPLES, NULL);
+        } else {
+            spectrogram_kiss_push_adc_block(&sk, dma_buf, DMA_SAMPLES, feat_live);
+        }
+    }
+
+    const uint16_t hops = spectrogram_kiss_slice_count(&sk);
+    if (hops == 0U) {
+        xprintf("[SHOT] no features\r\n");
+        return;
+    }
+
+    if (tflm_init() != 0) {
+        xprintf("[SHOT] init err=%d\r\n", tflm_last_error());
+        tflm_reset();
+        return;
+    }
+
+    size_t in_sz = 0U;
+    int8_t *in = (int8_t *)tflm_input_buffer(&in_sz);
+    if (in == NULL || in_sz != (size_t)SK_FEATURE_COUNT) {
+        xprintf("[SHOT] bad input\r\n");
+        tflm_reset();
+        return;
+    }
+
+    spectrogram_kiss_pack_for_inference(&sk, feat_live, hops, in);
+
+    if (tflm_invoke() != 0) {
+        xprintf("[SHOT] invoke err=%d\r\n", tflm_last_error());
+    } else {
+        const int cls = tflm_get_result();
+        xprintf("[SHOT] blk=%u hops=%u pk=%u cls=%s\r\n", (unsigned)n_blk, (unsigned)hops,
+                (unsigned)pk_max, cls_name(cls));
+    }
+    tflm_reset();
+}
+
+static void warm_noise_quiet(void) {
+    for (unsigned b = 0U; b < 8U; b++) {
+        if (dma_wait_block() != HAL_OK) {
+            break;
+        }
+        spectrogram_kiss_push_adc_block(&sk, dma_buf, DMA_SAMPLES, NULL);
+    }
+}
+
+static uint16_t quiet_cal(void) {
+    uint32_t sum = 0U;
+    unsigned n = 0U;
+    for (unsigned b = 0U; b < QUIET_BLOCKS; b++) {
+        if (dma_wait_block() != HAL_OK) {
+            break;
+        }
+        for (unsigned i = 0U; i < DMA_SAMPLES; i++) {
+            sum += dma_buf[i];
+            n++;
+        }
+    }
+    return (n > 0U) ? (uint16_t)(sum / n) : 2048U;
+}
+
+static uint16_t block_peak(const uint16_t *s, unsigned n) {
+    uint16_t lo = 0xFFFFU;
+    uint16_t hi = 0U;
+    for (unsigned i = 0U; i < n; i++) {
+        if (s[i] < lo) {
+            lo = s[i];
+        }
+        if (s[i] > hi) {
+            hi = s[i];
+        }
+    }
+    const uint16_t d_hi = (hi >= adc_mid) ? (hi - adc_mid) : (adc_mid - hi);
+    const uint16_t d_lo = (lo >= adc_mid) ? (lo - adc_mid) : (adc_mid - lo);
+    return (d_hi > d_lo) ? d_hi : d_lo;
+}
+
+static HAL_StatusTypeDef dma_wait_block(void) {
+    const uint32_t len = (uint32_t)(DMA_SAMPLES * sizeof(uint16_t)) - 1U;
+    dma_done = 0U;
+    DMA_TIMER->INT_CLEAR = 0xFFFFFFFFu;
+    HAL_DMA_Start(&hdma_ch, (void *)&ANALOG_REG->ADC_VALUE, dma_buf, len);
+
+    uint32_t saw_busy = 0U;
+    const uint32_t deadline = HAL_Time_SCR1TIM_Micros() +
+                              ((DMA_SAMPLES * 1000000UL) / SAMPLE_RATE_HZ) * 3U;
+    while (dma_done == 0U) {
+        if (HAL_DMA_GetChannelReadyStatus(&hdma_ch) == 0) {
+            saw_busy = 1U;
+        } else if (saw_busy != 0U) {
+            dma_done = 1U;
+            break;
+        }
+        if (HAL_Time_SCR1TIM_Micros() >= deadline) {
+            return HAL_TIMEOUT;
+        }
+    }
+    return HAL_OK;
+}
+
+static uint32_t timer_hz(void) {
+    return HAL_PCC_GetSysClockFreq() / ((PM->DIV_AHB + 1U) * (PM->DIV_APB_P + 1U));
+}
+
+static void timer_init(void) {
+    const uint32_t hz = timer_hz();
+    htimer.Instance = DMA_TIMER;
+    htimer.Top = (hz / SAMPLE_RATE_HZ) - 1U;
     htimer.Clock.Prescaler = 0;
-    htimer.Clock.Source = TIMER32_SOURCE_PRESCALER;
+    htimer.Clock.Source = TIMER32_SOURCE_TIM1_HCLK;
     htimer.CountMode = TIMER32_COUNTMODE_FORWARD;
     htimer.State = TIMER32_STATE_ENABLE;
     htimer.InterruptMask = 0;
-
     HAL_Timer32_Init(&htimer);
-    HAL_Timer32_Start(&htimer);
+    DMA_TIMER->INT_CLEAR = 0xFFFFFFFFu;
 }
 
-// void TMR_Init() {
-//     // Включение тактирования TIMER32_0
-//     PM->CLK_APB_M_SET = PM_CLOCK_APB_M_TIMER32_0_M;
-//     TIMER32_0->ENABLE = 0;
-//     TIMER32_0->TOP = 2000;
-//     TIMER32_0->PRESCALER = 0;
-//     TIMER32_0->CONTROL =
-//         TIMER32_CONTROL_MODE_UP_M | TIMER32_CONTROL_CLOCK_PRESCALER_M;
-//     TIMER32_0->INT_CLEAR = 0xFFFFFFFF;
-//     TIMER32_0->ENABLE = 1;
-//     // Включение прерывания по переполнению
-//     TIMER32_0->INT_MASK = 0;//TIMER32_INT_OVERFLOW_M;
-// }
-
-static void ADC_Init(void) {
+static void adc_init(void) {
     hadc.Instance = ANALOG_REG;
     hadc.Init.Sel = ADC_CHANNEL0;
-    hadc.Init.EXTRef = ADC_EXTREF_OFF; // Use internal 1.2V reference
+    hadc.Init.EXTRef = ADC_EXTREF_OFF;
     hadc.Init.EXTClb = ADC_EXTCLB_CLBREF;
-    
     HAL_ADC_Init(&hadc);
-
     HAL_ADC_ContinuousEnable(&hadc);
 }
 
-void configure_mem_to_mem_dma(DMA_InitTypeDef* hdma, DMA_ChannelHandleTypeDef* ch) {
-    ch->dma = hdma;
-
-    /* Настройки канала */
-    ch->ChannelInit.Channel = DMA_CHANNEL_1;
-    ch->ChannelInit.Priority = DMA_CHANNEL_PRIORITY_VERY_HIGH;
-
-    ch->ChannelInit.ReadMode = DMA_CHANNEL_MODE_MEMORY;
-    ch->ChannelInit.ReadInc = DMA_CHANNEL_INC_ENABLE;
-    ch->ChannelInit.ReadSize = DMA_CHANNEL_SIZE_BYTE; /* data_len должно быть кратно read_size */
-    ch->ChannelInit.ReadBurstSize = 0;                /* read_burst_size должно быть кратно read_size */
-    ch->ChannelInit.ReadRequest = 0;  //DMA_CHANNEL_USART_0_REQUEST;
-    ch->ChannelInit.ReadAck = DMA_CHANNEL_ACK_DISABLE;
-
+static void dma_ch_config(DMA_ChannelHandleTypeDef *ch) {
+    ch->dma = &hdma;
+    ch->ChannelInit.Channel = DMA_CHANNEL_0;
+    ch->ChannelInit.Priority = DMA_CHANNEL_PRIORITY_HIGH;
+    ch->ChannelInit.ReadMode = DMA_CHANNEL_MODE_PERIPHERY;
+    ch->ChannelInit.ReadInc = DMA_CHANNEL_INC_DISABLE;
+    ch->ChannelInit.ReadSize = DMA_CHANNEL_SIZE_HALFWORD;
+    ch->ChannelInit.ReadBurstSize = 1U;
+    ch->ChannelInit.ReadRequest = DMA_REQ;
+    ch->ChannelInit.ReadAck = DMA_CHANNEL_ACK_ENABLE;
     ch->ChannelInit.WriteMode = DMA_CHANNEL_MODE_MEMORY;
     ch->ChannelInit.WriteInc = DMA_CHANNEL_INC_ENABLE;
-    ch->ChannelInit.WriteSize = DMA_CHANNEL_SIZE_BYTE; /* data_len должно быть кратно write_size */
-    ch->ChannelInit.WriteBurstSize = 0;                /* write_burst_size должно быть кратно read_size */
-    ch->ChannelInit.WriteRequest = 0; //DMA_CHANNEL_USART_0_REQUEST;
-    ch->ChannelInit.WriteAck = DMA_CHANNEL_ACK_ENABLE;
+    ch->ChannelInit.WriteSize = DMA_CHANNEL_SIZE_HALFWORD;
+    ch->ChannelInit.WriteBurstSize = 1U;
+    ch->ChannelInit.WriteRequest = 0;
+    ch->ChannelInit.WriteAck = DMA_CHANNEL_ACK_DISABLE;
 }
 
-void DMA_Init(void) {
+static void dma_init(void) {
     hdma.Instance = DMA_CONFIG;
     hdma.CurrentValue = DMA_CURRENT_VALUE_ENABLE;
     HAL_DMA_Init(&hdma);
 }
 
-
-
-void configure_interrupts() {
-    __HAL_PCC_EPIC_CLK_ENABLE();
-    HAL_EPIC_MaskLevelSet(HAL_EPIC_UART_0_MASK);
-    // HAL_USART_RXNE_EnableInterrupt(&husart0);
-    HAL_IRQ_EnableInterrupts();
+void SystemClock_Config(void) {
+    PCC_InitTypeDef pcc = {0};
+    pcc.OscillatorEnable = PCC_OSCILLATORTYPE_ALL;
+    pcc.FreqMon.OscillatorSystem = PCC_OSCILLATORTYPE_OSC32M;
+    pcc.FreqMon.ForceOscSys = PCC_FORCE_OSC_SYS_UNFIXED;
+    pcc.FreqMon.Force32KClk = PCC_FREQ_MONITOR_SOURCE_OSC32K;
+    pcc.AHBDivider = 0;
+    pcc.APBMDivider = 0;
+    pcc.APBPDivider = 0;
+    pcc.HSI32MCalibrationValue = 128;
+    pcc.LSI32KCalibrationValue = 8;
+    pcc.RTCClockSelection = PCC_RTC_CLOCK_SOURCE_AUTO;
+    pcc.RTCClockCPUSelection = PCC_CPU_RTC_CLOCK_SOURCE_OSC32K;
+    HAL_PCC_Config(&pcc);
 }
 
-void HAL_ADC_MspInit(ADC_HandleTypeDef *hadc) {
-    GPIO_InitTypeDef GPIO_InitStruct = { 0 };
-    __HAL_PCC_ANALOG_REGS_CLK_ENABLE();
-
-    GPIO_InitStruct.Mode = HAL_GPIO_MODE_ANALOG;
-    GPIO_InitStruct.Pull = HAL_GPIO_PULL_NONE;
-    GPIO_InitStruct.Pin = GPIO_PIN_5 | GPIO_PIN_7;
-    HAL_GPIO_Init(GPIO_1, &GPIO_InitStruct);
-
-    GPIO_InitStruct.Pin = GPIO_PIN_2 | GPIO_PIN_4 | GPIO_PIN_7 | GPIO_PIN_9;
-    HAL_GPIO_Init(GPIO_0, &GPIO_InitStruct);
+static void clock_init(void) {
+    SystemClock_Config();
 }
 
-void USART_Init()
-{
+static void usart_init(void) {
     husart0.Instance = UART_0;
     husart0.transmitting = Enable;
     husart0.receiving = Enable;
@@ -247,98 +385,13 @@ void USART_Init()
     husart0.Interrupt.rxneie = Disable;
     husart0.Interrupt.tcie = Disable;
     husart0.Interrupt.txeie = Disable;
-    husart0.Modem.rts = Disable; //out
-    husart0.Modem.cts = Disable; //in
-    husart0.Modem.dtr = Disable; //out
-    husart0.Modem.dcd = Disable; //in
-    husart0.Modem.dsr = Disable; //in
-    husart0.Modem.ri = Disable;  //in
-    husart0.Modem.ddis = Disable;//out
+    husart0.Modem.rts = Disable;
+    husart0.Modem.cts = Disable;
+    husart0.Modem.dtr = Disable;
+    husart0.Modem.dcd = Disable;
+    husart0.Modem.dsr = Disable;
+    husart0.Modem.ri = Disable;
+    husart0.Modem.ddis = Disable;
     husart0.baudrate = 115200;
     HAL_USART_Init(&husart0);
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-// void DMA_Init() {
-//     // Initialize DMA controller
-//     hdma.Instance = DMA_CONFIG;
-//     hdma.CurrentValue = DMA_CURRENT_VALUE_DISABLE;
-//     HAL_DMA_Init(&hdma);
-    
-//     // Clear any pending interrupts from before
-//     HAL_DMA_ClearIrq(&hdma);
-    
-//     // Enable global DMA interrupt
-//     HAL_DMA_GlobalIRQEnable(&hdma, DMA_IRQ_ENABLE);
-    
-//     // Configure channel
-//     hdma_ch_adc.dma = &hdma;
-//     hdma_ch_adc.ChannelInit.Channel = DMA_CHANNEL_1;  // Use channel 1
-//     hdma_ch_adc.ChannelInit.Priority = DMA_CHANNEL_PRIORITY_HIGH;
-    
-//     // Source: ADC register (peripheral, no increment)
-//     hdma_ch_adc.ChannelInit.ReadMode = DMA_CHANNEL_MODE_PERIPHERY;
-//     hdma_ch_adc.ChannelInit.ReadInc = DMA_CHANNEL_INC_DISABLE;  // Fixed address
-//     hdma_ch_adc.ChannelInit.ReadSize = DMA_CHANNEL_SIZE_HALFWORD;  // 16-bit ADC
-//     hdma_ch_adc.ChannelInit.ReadBurstSize = 0;
-//     hdma_ch_adc.ChannelInit.ReadRequest = DMA_CHANNEL_TIMER32_0_REQUEST;
-//     // With handshake enabled, DMA waits for each timer pulse (paced transfer)
-//     hdma_ch_adc.ChannelInit.ReadAck = DMA_CHANNEL_ACK_ENABLE;
-    
-//     // Destination: RAM buffer (memory, increment)
-//     hdma_ch_adc.ChannelInit.WriteMode = DMA_CHANNEL_MODE_MEMORY;
-//     hdma_ch_adc.ChannelInit.WriteInc = DMA_CHANNEL_INC_ENABLE;
-//     hdma_ch_adc.ChannelInit.WriteSize = DMA_CHANNEL_SIZE_HALFWORD;
-//     hdma_ch_adc.ChannelInit.WriteBurstSize = 0;
-//     hdma_ch_adc.ChannelInit.WriteRequest = 0;
-//     hdma_ch_adc.ChannelInit.WriteAck = DMA_CHANNEL_ACK_DISABLE;
-    
-//     // Start continuous DMA transfer
-//     HAL_DMA_Start(&hdma_ch_adc, 
-//                   (void*)&ANALOG_REG->ADC_VALUE,
-//                   (void*)adc_buffer,
-//                   ADC_BUFFER_SIZE - 1);
-    
-//     // Wait a moment for DMA to be ready
-//     for (volatile int i = 0; i < 10000; i++) asm("nop");
-    
-//     int ready = HAL_DMA_GetChannelReadyStatus(&hdma_ch_adc);
-//     int irq = HAL_DMA_GetChannelIrq(&hdma_ch_adc);
-//     int err = HAL_DMA_GetBusError(&hdma_ch_adc);
-    
-//     xprintf("DMA Start: Ready=%d IRQ=%d BusErr=%d\r\n", ready, irq, err);
-//     xprintf("DMA Channel CFG before: 0x%08lx\r\n", hdma.Instance->CHANNELS[1].CFG);
-//     xprintf("DMA Status: 0x%08lx\r\n", hdma.Instance->CONFIG_STATUS);
-    
-//     // If still not ready, try enabling the channel explicitly
-//     if (!ready) {
-//         xprintf("Channel not ready! Trying explicit enable...\r\n");
-//         HAL_DMA_ChannelEnable(&hdma_ch_adc);
-        
-//         for (volatile int i = 0; i < 10000; i++) asm("nop");
-        
-//         ready = HAL_DMA_GetChannelReadyStatus(&hdma_ch_adc);
-//         xprintf("After explicit enable: Ready=%d\r\n", ready);
-//         HAL_DMA_Start(&hdma_ch_adc, 
-//                   (void*)&ANALOG_REG->ADC_VALUE,
-//                   (void*)adc_buffer,
-//                   ADC_BUFFER_SIZE - 1);
-//     }
-    
-//     xprintf("DMA configured. Channel ready: %d\r\n", HAL_DMA_GetChannelReadyStatus(&hdma_ch_adc));
-// }

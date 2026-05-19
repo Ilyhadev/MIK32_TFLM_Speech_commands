@@ -1,4 +1,3 @@
-/* Strong definition: TensorFlow Lite Micro (mik32/debug_log.cc) calls this for log lines. */
 #include "xprintf.h"
 
 void xputc(char c);

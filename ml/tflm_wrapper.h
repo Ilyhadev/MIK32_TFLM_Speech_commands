@@ -9,24 +9,18 @@
 extern "C" {
 #endif
 
-// Initialize model and interpreter. Returns 0 on success.
 int tflm_init(void);
 int tflm_last_error(void);
-size_t tflm_arena_used_bytes(void);
-size_t tflm_model_len_bytes(void);
-
-// Run inference on a preprocessed input (1960 bytes for 49x40 spectrogram)
-int tflm_run(const int8_t* input, size_t input_size);
-int8_t* tflm_input_buffer(size_t* input_size);
-
-// Get the class index (0 = silence, 1 = unknown, 2 = yes, 3 = no)
+int tflm_invoke(void);
+void *tflm_input_buffer(size_t *input_size);
 int tflm_get_result(void);
+void tflm_reset(void);
 
-size_t tflm_input_bytes(void);
+/** Pre-init RAM slab for PCM capture (index 0 only). */
+int tflm_preinit_scratch_region(unsigned index, void **out_ptr, size_t *out_bytes);
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif // TFLM_WRAPPER_H
-
+#endif

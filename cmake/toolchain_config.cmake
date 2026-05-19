@@ -16,10 +16,12 @@ string(CONCAT COMMON_FLAGS
     " -march=rv32imc_zicsr_zifencei"
     " -mabi=ilp32"
     " -mcmodel=medlow"
-    " -g3 -O1"
+    " -g3 -O2"
     " -Wall"
     " -fsigned-char -ffunction-sections"
     " -DMIK32V2"
+    " -DTF_LITE_STATIC_MEMORY"
+    " -DTF_LITE_DISABLE_X86_NEON"
 )
 
 string(CONCAT C_FLAGS
@@ -50,6 +52,7 @@ string(CONCAT LINK_FLAGS
     " -Tuser.ld"
     " -Xlinker --gc-sections"
     " -nostartfiles"
+    " -specs=nano.specs"
 )
 
 set(CMAKE_EXE_LINKER_FLAGS ${LINK_FLAGS})

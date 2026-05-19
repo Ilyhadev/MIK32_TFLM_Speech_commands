@@ -14,7 +14,6 @@ extern uint8_t __sp;
 extern const uint8_t __data_source_start;
 extern uint8_t __data_target_start;
 extern uint8_t __data_target_end;
-
 extern function_t __init_array_start;
 extern function_t __init_array_end;
 extern function_t __preinit_array_start;
@@ -25,10 +24,6 @@ extern function_t __fini_array_end;
 // This function will be placed by the linker script according to the section
 // Raw function 'called' by the CPU with no runtime.
 extern void _enter(void) __attribute__((naked, section(".text.init.enter")));
-extern void trap_handler_raw(void)
-    __attribute__((interrupt("machine"),
-                   section(".text.riscv_trap.trap_handler_raw")));
-void trap_handler(void) __attribute__((weak));
 
 // Entry and exit points as C functions.
 extern void _start(void) __attribute__((noreturn));
@@ -37,14 +32,6 @@ void _Exit(int exit_code) __attribute__((noreturn, noinline));
 // Standard entry point, no arguments.
 extern int main(void);
 extern void SystemInit(void);
-
-void trap_handler_raw(){
-    trap_handler();
-}
-
-void trap_handler(){
-    while(1){}
-}
 
 // The linker script will place this in the reset entry point.
 // It will be 'called' with no stack or C runtime configuration.
@@ -85,7 +72,7 @@ void _start(void) {
 
     // Initialize the .data section (global variables with initial values)
     memcpy((void*)&__data_target_start, (const void*)&__data_source_start, (&__data_target_end - &__data_target_start));
-    
+
     // Call constructors
     for (const function_t* entry = &__preinit_array_start; entry < &__preinit_array_end; ++entry) {
         (*entry)();
