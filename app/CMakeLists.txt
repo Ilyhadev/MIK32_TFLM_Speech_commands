@@ -12,7 +12,6 @@ add_executable(${APP_NAME}
 target_link_libraries(${APP_NAME} PRIVATE
     mik32_hal
     tflm_wrapper
-    model_data
     spectrogram_kiss
 )
 

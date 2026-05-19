@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-"""Plot [TENSOR] dumps from UART (optional matplotlib)."""
-
 from __future__ import annotations
 
 import argparse

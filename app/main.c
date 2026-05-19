@@ -23,10 +23,9 @@ void *__dso_handle __attribute__((weak));
 #define DMA_SAMPLES (SK_FRAME_HOP * 2U)
 #define HOPS_PER_DMA_BLOCK (DMA_SAMPLES / SK_FRAME_HOP)
 #define MAX_LIVE_HOPS 16U
-#define LOOP_LOG_EVERY 20U
 #define QUIET_BLOCKS 20U
-#define TRIGGER_PK 300U
-#define MIC_GAIN_Q8 48
+#define TRIGGER_PK 200U
+#define MIC_GAIN_Q8 32
 
 static USART_HandleTypeDef husart0;
 static ADC_HandleTypeDef hadc;
@@ -41,8 +40,6 @@ static bool shot_fft_stashed;
 
 static volatile uint32_t dma_done;
 static uint16_t adc_mid = 1630U;
-static uint16_t pk_win_max;
-
 static const char *cls_name(int c) {
     static const char *const n[] = {"silence", "unknown", "yes", "no"};
     if (c == -1) {
@@ -62,11 +59,9 @@ static HAL_StatusTypeDef dma_wait_block(void);
 static uint16_t block_peak(const uint16_t *s, unsigned n);
 static uint16_t quiet_cal(void);
 static void warm_noise_quiet(void);
-static unsigned tensor_saturated_bins(const int8_t *tensor);
 static HAL_StatusTypeDef record_shot(void);
 static void shot_stash_fft_blocks(unsigned n_blk);
 static const uint16_t *shot_pcm_block(unsigned block_index);
-static void log_model_input(const int8_t *tensor);
 static void process_shot(void);
 
 int main(void) {
@@ -86,78 +81,33 @@ int main(void) {
         }
     }
 
-    xprintf("[BOOT] quiet cal %u blocks...\r\n", (unsigned)QUIET_BLOCKS);
     adc_mid = quiet_cal();
     spectrogram_kiss_set_cal(&sk, adc_mid, MIC_GAIN_Q8);
-    spectrogram_kiss_begin_pad_cal(&sk);
-    warm_noise_quiet();
-    if (!spectrogram_kiss_finish_pad_cal(&sk)) {
-        spectrogram_kiss_set_default_pad(&sk);
-        xprintf("[BOOT] pad cal fallback default\r\n");
-    }
     warm_noise_quiet();
     spectrogram_kiss_reset_stream(&sk);
-
     adc_ram_capture_reset();
-    const unsigned cap_blk =
-        (unsigned)((adc_ram_capture_pool_bytes() + ADC_RAM_CAPTURE_BLOCK_BYTES) /
-                   ADC_RAM_CAPTURE_BLOCK_BYTES);
-    xprintf("[BOOT] mid=%u gain=%u trigger pk>=%u\r\n", (unsigned)adc_mid, (unsigned)MIC_GAIN_Q8,
-            (unsigned)TRIGGER_PK);
-    xprintf("[BOOT] dma_blk=%u B capture=%u B (~%u blk w/ fft_mem) arena=%u B\r\n",
-            (unsigned)sizeof(dma_buf), (unsigned)adc_ram_capture_pool_bytes(), cap_blk,
-            (unsigned)tflm_arena_size_bytes());
-    xprintf("[BOOT] DMA %u Hz %u smp/blk ~40ms (~25 blk/s idle)\r\n", (unsigned)SAMPLE_RATE_HZ,
-            (unsigned)DMA_SAMPLES);
 
-    uint32_t blocks = 0;
-    uint32_t log_t0 = HAL_Time_SCR1TIM_Micros();
+    xprintf("[BOOT] mid=%u gain=%u pk>=%u cap=%uB\r\n", (unsigned)adc_mid, (unsigned)MIC_GAIN_Q8,
+            (unsigned)TRIGGER_PK, (unsigned)adc_ram_capture_pool_bytes());
 
     for (;;) {
-        blocks++;
         if (dma_wait_block() != HAL_OK) {
             continue;
         }
 
         const uint16_t pk = block_peak(dma_buf, DMA_SAMPLES);
-        if (pk > pk_win_max) {
-            pk_win_max = pk;
-        }
-
         if (pk >= TRIGGER_PK) {
             static uint32_t cooldown;
             if (cooldown > 0U) {
                 cooldown--;
                 continue;
             }
-            xprintf("[SHOT] pk=%u record\r\n", (unsigned)pk);
             if (record_shot() == HAL_OK) {
                 process_shot();
-                log_t0 = HAL_Time_SCR1TIM_Micros();
-                cooldown = 80U;
             } else {
-                xprintf("[SHOT] record failed\r\n");
+                xprintf("[SHOT] record fail\r\n");
             }
-            continue;
-        }
-
-        if ((blocks % LOOP_LOG_EVERY) == 0U) {
-            uint16_t lo = 0xFFFFU;
-            uint16_t hi = 0U;
-            for (unsigned i = 0U; i < DMA_SAMPLES; i++) {
-                if (dma_buf[i] < lo) {
-                    lo = dma_buf[i];
-                }
-                if (dma_buf[i] > hi) {
-                    hi = dma_buf[i];
-                }
-            }
-            const uint32_t dt = HAL_Time_SCR1TIM_Micros() - log_t0;
-            log_t0 = HAL_Time_SCR1TIM_Micros();
-            const uint32_t blk_per_s = (dt > 0U) ? (LOOP_LOG_EVERY * 1000000UL / dt) : 0U;
-            xprintf("[LOOP] blk=%lu ~%lu blk/s adc=%u..%u pk=%u\r\n", (unsigned long)blocks,
-                    (unsigned long)blk_per_s, (unsigned)lo, (unsigned)hi, (unsigned)pk_win_max);
-            pk_win_max = 0U;
+            cooldown = 80U;
         }
     }
 }
@@ -180,7 +130,6 @@ static HAL_StatusTypeDef record_shot(void) {
             return HAL_ERROR;
         }
     }
-    xprintf("[SHOT] stored %u blk\r\n", (unsigned)adc_ram_capture_block_count());
     return HAL_OK;
 }
 
@@ -221,12 +170,11 @@ static void process_shot(void) {
 
     spectrogram_kiss_reset_stream(&sk);
     uint16_t pk_max = 0U;
-    const uint32_t t_fft0 = HAL_Time_SCR1TIM_Micros();
 
     for (unsigned b = 0U; b < n_blk; b++) {
         const uint16_t *pcm = shot_pcm_block(b);
         if (pcm == NULL) {
-            xprintf("[SHOT] bad block %u\r\n", (unsigned)b);
+            xprintf("[SHOT] bad blk %u\r\n", (unsigned)b);
             return;
         }
         memcpy(dma_buf, pcm, DMA_SAMPLES * sizeof(uint16_t));
@@ -242,15 +190,13 @@ static void process_shot(void) {
     }
 
     const uint16_t hops = spectrogram_kiss_slice_count(&sk);
-    const uint32_t fft_ms = (HAL_Time_SCR1TIM_Micros() - t_fft0) / 1000U;
     if (hops == 0U) {
         xprintf("[SHOT] no features\r\n");
         return;
     }
 
-    const uint32_t t_init0 = HAL_Time_SCR1TIM_Micros();
     if (tflm_init() != 0) {
-        xprintf("[SHOT] tflm_init err=%d\r\n", tflm_last_error());
+        xprintf("[SHOT] init err=%d\r\n", tflm_last_error());
         tflm_reset();
         return;
     }
@@ -258,48 +204,21 @@ static void process_shot(void) {
     size_t in_sz = 0U;
     int8_t *in = (int8_t *)tflm_input_buffer(&in_sz);
     if (in == NULL || in_sz != (size_t)SK_FEATURE_COUNT) {
-        xprintf("[SHOT] bad input %lu\r\n", (unsigned long)in_sz);
+        xprintf("[SHOT] bad input\r\n");
         tflm_reset();
         return;
     }
 
     spectrogram_kiss_pack_for_inference(&sk, feat_live, hops, in);
-    const unsigned sat_bins = tensor_saturated_bins(in);
-    const uint32_t init_ms = (HAL_Time_SCR1TIM_Micros() - t_init0) / 1000U;
-    log_model_input(in);
 
-    const uint32_t t_inv0 = HAL_Time_SCR1TIM_Micros();
-    const int err = tflm_invoke();
-    const uint32_t inv_ms = (HAL_Time_SCR1TIM_Micros() - t_inv0) / 1000U;
-
-    if (err != 0) {
+    if (tflm_invoke() != 0) {
         xprintf("[SHOT] invoke err=%d\r\n", tflm_last_error());
     } else {
         const int cls = tflm_get_result();
-        const unsigned speech0 =
-            (SK_SPEECH_END_COL + 1U >= hops) ? (unsigned)(SK_SPEECH_END_COL + 1U - hops) : 0U;
-        xprintf("[SHOT] hops=%u pk=%u sat=%u col%u..%u cls=%s fft=%lums init=%lums inv=%lums\r\n",
-                (unsigned)hops, (unsigned)pk_max, sat_bins, speech0, (unsigned)SK_SPEECH_END_COL,
-                cls_name(cls), (unsigned long)fft_ms, (unsigned long)init_ms, (unsigned long)inv_ms);
-        tflm_log_output_scores();
+        xprintf("[SHOT] blk=%u hops=%u pk=%u cls=%s\r\n", (unsigned)n_blk, (unsigned)hops,
+                (unsigned)pk_max, cls_name(cls));
     }
     tflm_reset();
-}
-
-static void log_model_input(const int8_t *tensor) {
-    if (tensor == NULL) {
-        return;
-    }
-    xprintf("[TENSOR] shape %u %u\r\n", (unsigned)SK_SLICES, (unsigned)SK_BINS);
-    xprintf("[TENSOR] begin\r\n");
-    for (unsigned col = 0U; col < SK_SLICES; col++) {
-        xprintf("[TENSOR] col%02u:", col);
-        for (unsigned bin = 0U; bin < SK_BINS; bin++) {
-            xprintf(" %d", (int)tensor[(size_t)col * SK_BINS + bin]);
-        }
-        xprintf("\r\n");
-    }
-    xprintf("[TENSOR] end\r\n");
 }
 
 static void warm_noise_quiet(void) {
@@ -324,16 +243,6 @@ static uint16_t quiet_cal(void) {
         }
     }
     return (n > 0U) ? (uint16_t)(sum / n) : 2048U;
-}
-
-static unsigned tensor_saturated_bins(const int8_t *tensor) {
-    unsigned sat = 0U;
-    for (unsigned i = 0U; i < SK_FEATURE_COUNT; i++) {
-        if (tensor[i] >= 127 || tensor[i] <= -128) {
-            sat++;
-        }
-    }
-    return sat;
 }
 
 static uint16_t block_peak(const uint16_t *s, unsigned n) {

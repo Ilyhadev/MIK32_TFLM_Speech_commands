@@ -7,16 +7,6 @@
 
 #include <cstring>
 
-#ifndef SPECTROGRAM_HOST
-#include <analog_reg.h>
-#include <mik32_memory_map.h>
-extern "C" uint32_t HAL_Time_SCR1TIM_Micros(void);
-#else
-extern "C" uint32_t HAL_Time_SCR1TIM_Micros(void) {
-    return 0U;
-}
-#endif
-
 #include "signal/src/complex.h"
 #include "signal/src/energy.h"
 #include "signal/src/fft_auto_scale.h"
@@ -28,11 +18,6 @@ extern "C" uint32_t HAL_Time_SCR1TIM_Micros(void) {
 #include "signal/src/pcan_argc_fixed.h"
 
 namespace {
-
-/** One hop of raw ADC; filled in speak window before FFT (RAM limited). */
-constexpr uint16_t kCoopCap = SK_FRAME_HOP;
-static uint16_t g_coop_adc[kCoopCap];
-static uint16_t g_coop_adc_count;
 
 void spectrogram_kiss_write_inference_features_impl(const SpectrogramKissState *st,
                                                     const int8_t *feature_window, int8_t *out);
@@ -160,13 +145,6 @@ static void compute_slice(SpectrogramKissState *st, int8_t *out40) {
     limit_column_peak(out40);
 }
 
-static const int8_t *pad_column_ptr(const SpectrogramKissState *st) {
-    if (st != nullptr && st->pad_column_valid) {
-        return st->pad_column;
-    }
-    return kDefaultPadColumn;
-}
-
 static int8_t *slice_column_ptr(SpectrogramKissState *st, int8_t *feature_window) {
     if (feature_window == nullptr) {
         return nullptr;
@@ -181,20 +159,11 @@ static int8_t *slice_column_ptr(SpectrogramKissState *st, int8_t *feature_window
 
 static void emit_hop_slice(SpectrogramKissState *st, int8_t *feature_window) {
     int8_t scratch[SK_BINS];
-    int8_t *slice_out = nullptr;
-    if (feature_window != nullptr) {
-        slice_out = slice_column_ptr(st, feature_window);
-    } else if (st->pad_cal_active) {
-        slice_out = st->pad_column;
-    } else {
-        /* Still run mel/PCAN so noise_estimate tracks (feature_window may be NULL). */
-        slice_out = scratch;
-    }
+    int8_t *slice_out = (feature_window != nullptr) ? slice_column_ptr(st, feature_window) : scratch;
 
     compute_slice(st, slice_out);
 
-    /* Noise-only warmup: advance PCAN/noise_estimate, do not consume feat_live slots. */
-    if (feature_window == nullptr && !st->pad_cal_active) {
+    if (feature_window == nullptr) {
         st->frame_seq++;
         return;
     }
@@ -206,23 +175,6 @@ static void emit_hop_slice(SpectrogramKissState *st, int8_t *feature_window) {
         }
     }
     st->frame_seq++;
-}
-
-static void push_adc_sample(SpectrogramKissState *st, uint16_t adc12_sample, int8_t *feature_window) {
-    if (st == nullptr || st->fftr_cfg == nullptr) {
-        return;
-    }
-
-    const int16_t pcm16 = adc12_to_pcm16(st, adc12_sample);
-    st->frame_buffer[st->write_index] = pcm16;
-    st->write_index = static_cast<uint16_t>((st->write_index + 1U) % SK_FRAME_LEN);
-    st->samples_since_last_frame++;
-
-    if (st->samples_since_last_frame < SK_FRAME_HOP) {
-        return;
-    }
-    st->samples_since_last_frame = 0U;
-    emit_hop_slice(st, feature_window);
 }
 
 void spectrogram_kiss_write_inference_features_impl(const SpectrogramKissState *st,
@@ -237,14 +189,13 @@ void spectrogram_kiss_write_inference_features_impl(const SpectrogramKissState *
         return;
     }
     if (st == nullptr || st->slice_count < SK_SLICES) {
-        const int8_t *const pad = pad_column_ptr(st);
         const uint16_t sc = (st != nullptr) ? st->slice_count : 0U;
         const uint16_t pad_cols = static_cast<uint16_t>(SK_SLICES - sc);
         if (sc > 0U) {
             std::memcpy(&out[pad_cols * SK_BINS], feature_window, static_cast<size_t>(sc) * SK_BINS);
         }
         for (uint16_t s = 0; s < pad_cols; s++) {
-            std::memcpy(&out[s * SK_BINS], pad, SK_BINS);
+            std::memcpy(&out[s * SK_BINS], kDefaultPadColumn, SK_BINS);
         }
         return;
     }
@@ -334,14 +285,6 @@ static void soften_speech_edges(int8_t *out, uint16_t lead_cols, uint16_t speech
 
 extern "C" {
 
-void spectrogram_kiss_set_default_pad(SpectrogramKissState *st) {
-    if (st == nullptr) {
-        return;
-    }
-    std::memcpy(st->pad_column, kDefaultPadColumn, SK_BINS);
-    st->pad_column_valid = true;
-}
-
 void spectrogram_kiss_init(SpectrogramKissState *st) {
     std::memset(st, 0, sizeof(*st));
     st->adc_midpoint = 2048U;
@@ -391,13 +334,6 @@ bool spectrogram_kiss_ensure_fft(SpectrogramKissState *st) {
     return st->fftr_cfg != nullptr;
 }
 
-uint32_t spectrogram_kiss_fft_mem_used(const SpectrogramKissState *st) {
-    if (st == nullptr) {
-        return 0U;
-    }
-    return st->fft_mem_bytes;
-}
-
 void spectrogram_kiss_set_cal(SpectrogramKissState *st, uint16_t adc_midpoint, int16_t mic_gain_q8) {
     if (st == nullptr) {
         return;
@@ -413,12 +349,7 @@ void spectrogram_kiss_reset_stream(SpectrogramKissState *st) {
     if (st == nullptr) {
         return;
     }
-    int8_t saved_pad[SK_BINS];
-    const bool saved_valid = st->pad_column_valid;
     uint32_t saved_noise[SK_BINS];
-    if (saved_valid) {
-        std::memcpy(saved_pad, st->pad_column, SK_BINS);
-    }
     std::memcpy(saved_noise, st->noise_estimate, sizeof(saved_noise));
 
     st->write_index = 0U;
@@ -426,76 +357,8 @@ void spectrogram_kiss_reset_stream(SpectrogramKissState *st) {
     st->slice_count = 0U;
     st->oldest_col = 0U;
     st->frame_seq = 0U;
-    st->dc_estimate = 0;
     std::memset(st->frame_buffer, 0, sizeof(st->frame_buffer));
     std::memcpy(st->noise_estimate, saved_noise, sizeof(saved_noise));
-
-    if (saved_valid) {
-        std::memcpy(st->pad_column, saved_pad, SK_BINS);
-        st->pad_column_valid = true;
-    }
-}
-
-void spectrogram_kiss_begin_pad_cal(SpectrogramKissState *st) {
-    if (st == nullptr) {
-        return;
-    }
-    st->pad_column_valid = false;
-    st->pad_cal_active = true;
-    std::memset(st->noise_estimate, 0, sizeof(st->noise_estimate));
-    st->write_index = 0U;
-    st->samples_since_last_frame = 0U;
-    st->slice_count = 0U;
-    st->oldest_col = 0U;
-    st->frame_seq = 0U;
-    st->dc_estimate = 0;
-    std::memset(st->frame_buffer, 0, sizeof(st->frame_buffer));
-}
-
-bool spectrogram_kiss_pad_ready(const SpectrogramKissState *st) {
-    return st != nullptr && st->pad_column_valid;
-}
-
-bool spectrogram_kiss_finish_pad_cal(SpectrogramKissState *st) {
-    if (st == nullptr) {
-        return false;
-    }
-    st->pad_cal_active = false;
-    if (st->slice_count == 0U) {
-        return false;
-    }
-    st->pad_column_valid = true;
-    st->write_index = 0U;
-    st->samples_since_last_frame = 0U;
-    st->slice_count = 0U;
-    st->oldest_col = 0U;
-    st->frame_seq = 0U;
-    st->dc_estimate = 0;
-    std::memset(st->frame_buffer, 0, sizeof(st->frame_buffer));
-    return true;
-}
-
-void spectrogram_kiss_push_adc(SpectrogramKissState *st, uint16_t adc12_sample, int8_t *feature_window) {
-    push_adc_sample(st, adc12_sample, feature_window);
-}
-
-static void push_pcm_samples(SpectrogramKissState *st, const int16_t *pcm, size_t count,
-                             int8_t *feature_window) {
-    for (size_t i = 0; i < count; i++) {
-        st->frame_buffer[st->write_index] = pcm[i];
-        st->write_index = static_cast<uint16_t>((st->write_index + 1U) % SK_FRAME_LEN);
-    }
-    st->samples_since_last_frame =
-        static_cast<uint16_t>(st->samples_since_last_frame + static_cast<uint16_t>(count));
-
-    while (st->samples_since_last_frame >= SK_FRAME_HOP) {
-        st->samples_since_last_frame =
-            static_cast<uint16_t>(st->samples_since_last_frame - SK_FRAME_HOP);
-        if (feature_window != nullptr && !st->pad_cal_active && st->slice_count >= SK_SLICES) {
-            continue;
-        }
-        emit_hop_slice(st, feature_window);
-    }
 }
 
 void spectrogram_kiss_push_adc_block(SpectrogramKissState *st, const uint16_t *adc12_block, size_t count,
@@ -511,7 +374,7 @@ void spectrogram_kiss_push_adc_block(SpectrogramKissState *st, const uint16_t *a
         while (st->samples_since_last_frame >= SK_FRAME_HOP) {
             st->samples_since_last_frame =
                 static_cast<uint16_t>(st->samples_since_last_frame - SK_FRAME_HOP);
-            if (feature_window != nullptr && !st->pad_cal_active && st->slice_count >= SK_SLICES) {
+            if (feature_window != nullptr && st->slice_count >= SK_SLICES) {
                 continue;
             }
             emit_hop_slice(st, feature_window);
@@ -519,20 +382,13 @@ void spectrogram_kiss_push_adc_block(SpectrogramKissState *st, const uint16_t *a
     }
 }
 
-void spectrogram_kiss_push_pcm16_block(SpectrogramKissState *st, const int16_t *pcm_block, size_t count,
-                                       int8_t *feature_window) {
-    if (st == nullptr || st->fftr_cfg == nullptr || pcm_block == nullptr || count == 0U) {
-        return;
-    }
-    push_pcm_samples(st, pcm_block, count, feature_window);
-}
-
 void spectrogram_kiss_pack_for_inference(const SpectrogramKissState *st, const int8_t *feature_window,
                                          uint16_t slice_count, int8_t *out) {
     if (out == nullptr) {
         return;
     }
-    const int8_t *const pad = pad_column_ptr(st);
+    /* Padding must match micro_speech training (flat ~100), not room FFT columns. */
+    const int8_t *const pad = kDefaultPadColumn;
     if (feature_window == nullptr || slice_count == 0U) {
         for (uint16_t s = 0; s < SK_SLICES; s++) {
             std::memcpy(&out[s * SK_BINS], pad, SK_BINS);
@@ -561,91 +417,11 @@ void spectrogram_kiss_pack_for_inference(const SpectrogramKissState *st, const i
     soften_speech_edges(out, lead_cols, slice_count, pad);
 }
 
-void spectrogram_kiss_write_inference_features(const SpectrogramKissState *st, const int8_t *feature_window,
-                                             int8_t *out) {
-    spectrogram_kiss_write_inference_features_impl(st, feature_window, out);
-}
-
-void spectrogram_kiss_last_column_minmax(const int8_t *feature_window, int8_t *out_min, int8_t *out_max) {
-    int8_t lo = 127;
-    int8_t hi = -128;
-    if (feature_window == nullptr) {
-        if (out_min != nullptr) {
-            *out_min = 0;
-        }
-        if (out_max != nullptr) {
-            *out_max = 0;
-        }
-        return;
-    }
-    const int8_t *col = &feature_window[SK_FEATURE_COUNT - SK_BINS];
-    for (uint16_t i = 0; i < SK_BINS; i++) {
-        const int8_t v = col[i];
-        if (v < lo) {
-            lo = v;
-        }
-        if (v > hi) {
-            hi = v;
-        }
-    }
-    if (out_min != nullptr) {
-        *out_min = lo;
-    }
-    if (out_max != nullptr) {
-        *out_max = hi;
-    }
-}
-
-bool spectrogram_kiss_ready(const SpectrogramKissState *st) {
-    return st != nullptr && st->fftr_cfg != nullptr && st->slice_count >= SK_MIN_SLICES_INFER;
-}
-
 uint16_t spectrogram_kiss_slice_count(const SpectrogramKissState *st) {
     if (st == nullptr) {
         return 0U;
     }
     return st->slice_count;
-}
-
-uint32_t spectrogram_kiss_frame_seq(const SpectrogramKissState *st) {
-    if (st == nullptr) {
-        return 0U;
-    }
-    return st->frame_seq;
-}
-
-uint16_t spectrogram_kiss_coop_poll_ms(uint32_t duration_ms) {
-    (void)duration_ms;
-#ifndef SPECTROGRAM_HOST
-    g_coop_adc_count = 0U;
-    if (duration_ms == 0U) {
-        return 0U;
-    }
-    const uint32_t deadline_us = HAL_Time_SCR1TIM_Micros() + (duration_ms * 1000U);
-    while ((int32_t)(HAL_Time_SCR1TIM_Micros() - deadline_us) < 0) {
-        if (g_coop_adc_count >= kCoopCap) {
-            break;
-        }
-        g_coop_adc[g_coop_adc_count++] = static_cast<uint16_t>(ANALOG_REG->ADC_VALUE);
-    }
-    return g_coop_adc_count;
-#else
-    return 0U;
-#endif
-}
-
-uint16_t spectrogram_kiss_drain_coop_hops(SpectrogramKissState *st, int8_t *feature_window,
-                                          uint16_t max_hops) {
-    if (st == nullptr || st->fftr_cfg == nullptr || max_hops == 0U) {
-        return 0U;
-    }
-    uint16_t hops = 0U;
-    while (hops < max_hops && g_coop_adc_count >= SK_FRAME_HOP) {
-        spectrogram_kiss_push_adc_block(st, g_coop_adc, SK_FRAME_HOP, feature_window);
-        g_coop_adc_count = static_cast<uint16_t>(g_coop_adc_count - SK_FRAME_HOP);
-        hops++;
-    }
-    return hops;
 }
 
 } // extern "C"
