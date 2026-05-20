@@ -24,8 +24,9 @@ void *__dso_handle __attribute__((weak));
 #define HOPS_PER_DMA_BLOCK (DMA_SAMPLES / SK_FRAME_HOP)
 #define MAX_LIVE_HOPS 16U
 #define QUIET_BLOCKS 20U
-#define TRIGGER_PK 200U
-#define MIC_GAIN_Q8 32
+// Params below should be changed according to your gain on mic
+#define TRIGGER_PK 1000U
+#define MIC_GAIN_Q8 8
 
 static USART_HandleTypeDef husart0;
 static ADC_HandleTypeDef hadc;
@@ -39,7 +40,7 @@ static uint8_t shot_fft_stash_blk;
 static bool shot_fft_stashed;
 
 static volatile uint32_t dma_done;
-static uint16_t adc_mid = 1630U;
+static uint16_t adc_mid = 1630U;  // Found imprically for MAX9814
 static const char *cls_name(int c) {
     static const char *const n[] = {"silence", "unknown", "yes", "no"};
     if (c == -1) {
@@ -97,6 +98,7 @@ int main(void) {
 
         const uint16_t pk = block_peak(dma_buf, DMA_SAMPLES);
         if (pk >= TRIGGER_PK) {
+            xprintf("[SHOOT] start to capture voice, pk = %d\n\r", pk);
             static uint32_t cooldown;
             if (cooldown > 0U) {
                 cooldown--;
@@ -126,6 +128,7 @@ static HAL_StatusTypeDef record_shot(void) {
         if (dma_wait_block() != HAL_OK) {
             return HAL_TIMEOUT;
         }
+        xprintf("[SHOT] block %d read\n\r", b);
         if (adc_ram_capture_append_block(dma_buf) != HAL_OK) {
             return HAL_ERROR;
         }
@@ -237,6 +240,7 @@ static uint16_t quiet_cal(void) {
         if (dma_wait_block() != HAL_OK) {
             break;
         }
+        xprintf("[BOOT] taking silence blocks, %d/%d\n\r", b, QUIET_BLOCKS);
         for (unsigned i = 0U; i < DMA_SAMPLES; i++) {
             sum += dma_buf[i];
             n++;
